@@ -260,13 +260,3 @@ OPENAI_API_KEY=sk-your-openai-api-key-here
 - Для UI-автотестов можно подключить Playwright (поддерживается MCP-интеграция в Cursor).
 
 ---
-
-**Контакты и ссылки:**
-
-- Together — https://together.sevostianovs.ru/ и бот `@RelationshipTogetherBot`
-- WishShare — https://wishshare.sevostianovs.ru/ и бот `@happywishlistbot`
-
-Оба проекта рекомендованы в шаблонном сообщении (см. `DEFAULT_MESSAGE` в `scripts/broadcast.py`).
-
-Удачных рассылок! Если нужна автоматизация дополнительных сценариев (логирование, планировщик, интеграция с CRM), можно расширить проект за счёт очередей/БД и управления кампаниями на бэкенде.
-
