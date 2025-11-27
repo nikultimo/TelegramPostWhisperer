@@ -1,0 +1,5 @@
+# Telegram Bots Configuration
+# Add your bots here with name and token
+bots:
+  - name: "MyBot"
+  - token ""

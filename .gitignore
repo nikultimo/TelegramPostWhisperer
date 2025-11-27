@@ -1,0 +1,5 @@
+.env
+bots.yaml
+data/
+__pycache__/
+*.pyc

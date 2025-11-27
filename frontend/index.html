@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0"
+    />
+    <title>Telegram Broadcast Studio</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  </head>
+  <body>
+    <header class="page-header">
+      <div class="logo">TG Sender</div>
+      <div class="header-subtitle">
+        Подготовьте кампанию, проверьте предпросмотр и отправьте рассылку через
+        своего бота.
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel form-panel">
+        <form id="broadcast-form" class="form-grid">
+          <fieldset class="field-block hidden" id="bot-selection-fieldset">
+            <label for="bot-selection">Выберите бота(ов)</label>
+            <div id="bot-selection-container"></div>
+            <p class="helper" id="bot-selection-helper">
+              Загрузка списка ботов...
+            </p>
+          </fieldset>
+
+          <fieldset class="field-block" id="token-fieldset">
+            <label for="token">Токен бота</label>
+            <input
+              type="password"
+              id="token"
+              name="token"
+              placeholder="123456789:ABC..."
+              required
+            />
+            <p class="helper">
+              Или создайте файл <code>bots.yaml</code> в корне проекта для выбора ботов из списка.
+            </p>
+          </fieldset>
+
+          <fieldset class="field-block" id="csv-selection-fieldset">
+            <label>CSV с telegram_id</label>
+            <div class="csv-selection-mode">
+              <label class="toggle">
+                <input type="radio" name="csv-mode" value="upload" id="csv-mode-upload" checked />
+                <span>Загрузить файл</span>
+              </label>
+              <label class="toggle">
+                <input type="radio" name="csv-mode" value="select" id="csv-mode-select" />
+                <span>Выбрать из папки data</span>
+              </label>
+            </div>
+            
+            <div id="csv-upload-container">
+              <input type="file" id="csv" name="csv_file" accept=".csv" required />
+              <p class="helper">
+                Ожидаем колонку <code>telegram_id</code> или ID в первой колонке.
+              </p>
+              <output id="csv-summary" class="summary"></output>
+            </div>
+            
+            <div id="csv-select-container" class="hidden">
+              <select id="csv-file-select" name="csv_file_name">
+                <option value="">Загрузка списка файлов...</option>
+              </select>
+              <p class="helper">
+                Выберите CSV файл из папки <code>data</code>.
+              </p>
+              <output id="csv-select-summary" class="summary"></output>
+            </div>
+          </fieldset>
+
+          <fieldset class="field-block">
+            <div class="message-header">
+              <label for="message">Сообщение (Markdown)</label>
+              <button type="button" id="enhance-button" class="ghost-button enhance-button">
+                ✨ Enhance
+              </button>
+            </div>
+            <textarea
+              id="message"
+              name="message"
+              rows="10"
+              required
+            ></textarea>
+          </fieldset>
+
+          <input
+            type="hidden"
+            id="parse-mode-input"
+            name="parse_mode"
+            value="Markdown"
+          />
+
+          <div class="field-row">
+            <label class="toggle">
+              <input type="checkbox" id="disable-preview" name="disable_preview" />
+              <span>Отключить предпросмотр ссылок</span>
+            </label>
+            <label class="toggle">
+              <input
+                type="checkbox"
+                id="attach-caption"
+                name="attach_message_to_first_photo"
+              />
+              <span>Отправить текст как подпись к первой фотографии</span>
+            </label>
+          </div>
+
+          <fieldset class="field-block">
+            <label for="photos">Фото (необязательно)</label>
+            <input
+              type="file"
+              id="photos"
+              name="photos"
+              accept="image/*"
+              multiple
+            />
+            <p class="helper">
+              Добавьте файлы или вставьте изображение из буфера обмена (Ctrl+V).
+              Удалите лишнее кликом по ×.
+            </p>
+            <div id="photo-preview" class="photo-preview"></div>
+          </fieldset>
+
+          <fieldset class="field-block">
+            <legend>Инлайн-кнопки</legend>
+            <div id="inline-builder" class="inline-builder"></div>
+            <div class="inline-actions">
+              <button type="button" id="add-row" class="ghost-button">
+                Добавить строку
+              </button>
+              <button type="button" id="reset-keyboard" class="ghost-button danger">
+                Сбросить
+              </button>
+            </div>
+            <textarea
+              id="inline-keyboard"
+              class="visually-hidden"
+              name="inline_keyboard"
+            ></textarea>
+          </fieldset>
+
+          <div class="form-actions">
+            <button type="submit" class="primary">Отправить рассылку</button>
+          </div>
+        </form>
+
+        <div id="result" class="result hidden"></div>
+      </section>
+
+      <section class="panel preview-panel">
+        <div class="preview-header">
+          <h2>Предпросмотр</h2>
+          <div class="parse-mode">
+            Режим форматирования:
+            <select id="parse-mode">
+              <option value="Markdown" selected>Markdown</option>
+              <option value="MarkdownV2">MarkdownV2</option>
+              <option value="HTML">HTML</option>
+              <option value="None">Без форматирования</option>
+            </select>
+          </div>
+        </div>
+
+        <article class="telegram-preview">
+          <div class="message-bubble">
+            <div id="preview-text" class="message-text"></div>
+            <div id="preview-photos" class="preview-photos"></div>
+            <div id="preview-buttons" class="preview-buttons"></div>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <template id="button-template">
+      <div class="button-entry inline-button-input">
+        <input
+          type="text"
+          class="btn-text"
+          placeholder="Текст кнопки"
+        />
+        <input type="url" class="btn-url" placeholder="URL (необязательно)" />
+        <input
+          type="text"
+          class="btn-callback"
+          placeholder="callback_data (альтернатива URL)"
+        />
+        <button type="button" class="ghost-button remove-button">×</button>
+      </div>
+    </template>
+
+    <template id="inline-row-template">
+      <div class="inline-row">
+        <div class="row-buttons"></div>
+        <button type="button" class="ghost-button add-button">+ Кнопка</button>
+      </div>
+    </template>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/assets/app.js" type="module"></script>
+  </body>
+</html>
+
