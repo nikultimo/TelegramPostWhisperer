@@ -36,6 +36,17 @@ class TelegramPhoto:
 
 
 @dataclass(slots=True)
+class TelegramVideo:
+    filename: str
+    content: bytes
+    content_type: str = "video/mp4"
+    duration: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    thumbnail: Optional[TelegramPhoto] = None
+
+
+@dataclass(slots=True)
 class DeliveryReport:
     chat_id: Union[int, str]
     ok: bool
@@ -61,7 +72,9 @@ class TelegramBroadcastConfig:
     disable_web_page_preview: bool = False
     inline_keyboard: Optional[List[List[InlineButton]]] = None
     photos: Optional[Sequence[TelegramPhoto]] = None
+    videos: Optional[Sequence[TelegramVideo]] = None
     attach_message_to_first_photo: bool = False
+    attach_message_to_first_video: bool = False
     extra_api_params: dict = field(default_factory=dict)
 
 
@@ -152,9 +165,50 @@ class TelegramSender:
         delivered = 0
 
         photos = list(config.photos or [])
+        videos = list(config.videos or [])
 
         for chat_id in chat_ids:
-            if photos:
+            if videos:
+                # Если есть видео, отправляем видео (с подписью или без)
+                # Inline-кнопки добавляем к последнему видео, если текст не прикреплен к первому
+                attach_to_last = not config.attach_message_to_first_video and config.inline_keyboard
+                media_failures = self._send_videos(
+                    chat_id,
+                    videos,
+                    config.attach_message_to_first_video,
+                    config.message if config.attach_message_to_first_video else "",
+                    config.parse_mode if config.attach_message_to_first_video else None,
+                    config.inline_keyboard if (config.attach_message_to_first_video or attach_to_last) else None,
+                    attach_to_last,
+                )
+                if media_failures:
+                    failed.extend(media_failures)
+                else:
+                    delivered += 1
+                
+                # Если текст не был прикреплен к первому видео, отправляем его отдельно
+                # Но без inline-кнопок, если они уже были на последнем видео
+                if not config.attach_message_to_first_video and config.message:
+                    if attach_to_last:
+                        # Создаем новый конфиг без inline-кнопок для текстового сообщения
+                        message_config = TelegramBroadcastConfig(
+                            token=config.token,
+                            message=config.message,
+                            parse_mode=config.parse_mode,
+                            disable_web_page_preview=config.disable_web_page_preview,
+                            inline_keyboard=None,  # Кнопки уже на последнем видео
+                            photos=None,
+                            videos=None,
+                            attach_message_to_first_photo=False,
+                            attach_message_to_first_video=False,
+                            extra_api_params=config.extra_api_params,
+                        )
+                    else:
+                        message_config = config
+                    message_result = self._send_message(chat_id, message_config)
+                    if not message_result.ok:
+                        failed.append(message_result)
+            elif photos:
                 # Если есть фото, отправляем фото (с подписью или без)
                 # Inline-кнопки добавляем к последнему фото, если текст не прикреплен к первой
                 attach_to_last = not config.attach_message_to_first_photo and config.inline_keyboard
@@ -393,6 +447,217 @@ class TelegramSender:
         else:
             # Если есть inline_keyboard, добавляем его к последнему сообщению в media group
             if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(photos) > 1)):
+                try:
+                    # Получаем ответ от sendMediaGroup, чтобы узнать message_id последнего сообщения
+                    response_data = response.json()
+                    if response_data.get("ok") and response_data.get("result"):
+                        messages = response_data["result"]
+                        if messages and len(messages) > 0:
+                            last_message_id = messages[-1].get("message_id")
+                            
+                            keyboard_dict = {
+                                "inline_keyboard": [
+                                    [button.to_dict() for button in row] for row in inline_keyboard
+                                ]
+                            }
+                            
+                            # Редактируем последнее сообщение, добавляя reply_markup
+                            edit_data = {
+                                "chat_id": chat_id,
+                                "message_id": last_message_id,
+                                "reply_markup": keyboard_dict,
+                            }
+                            
+                            edit_response = self.session.post(
+                                f"{self.base_url}/editMessageReplyMarkup",
+                                json=edit_data,
+                                timeout=15,
+                            )
+                            
+                            if not edit_response.ok:
+                                logger.warning("Failed to add inline keyboard to last message in media group")
+                except (KeyError, IndexError, TypeError, ValueError) as e:
+                    logger.error(f"Error adding inline keyboard to media group: {e}")
+                    # Fallback: отправляем отдельным сообщением
+                    try:
+                        keyboard_dict = {
+                            "inline_keyboard": [
+                                [button.to_dict() for button in row] for row in inline_keyboard
+                            ]
+                        }
+                        message_data = {
+                            "chat_id": chat_id,
+                            "text": " ",  # Минимальный текст
+                            "reply_markup": keyboard_dict,
+                        }
+                        self.session.post(
+                            f"{self.base_url}/sendMessage",
+                            json=message_data,
+                            timeout=15,
+                        )
+                    except Exception as fallback_error:
+                        logger.error(f"Fallback keyboard send also failed: {fallback_error}")
+
+        return failures
+
+    def _send_videos(
+        self,
+        chat_id: Union[int, str],
+        videos: Sequence[TelegramVideo],
+        attach_message: bool,
+        message: str,
+        parse_mode: Optional[str],
+        inline_keyboard: Optional[List[List[InlineButton]]],
+        attach_keyboard_to_last: bool = False,
+    ) -> List[DeliveryReport]:
+        failures: List[DeliveryReport] = []
+
+        if not videos:
+            return failures
+
+        # Если одно видео, используем sendVideo
+        if len(videos) == 1:
+            video = videos[0]
+            data = {"chat_id": chat_id}
+            
+            if attach_message:
+                data["caption"] = message
+                if parse_mode:
+                    data["parse_mode"] = parse_mode
+            
+            if video.duration:
+                data["duration"] = video.duration
+            if video.width:
+                data["width"] = video.width
+            if video.height:
+                data["height"] = video.height
+            
+            if inline_keyboard:
+                try:
+                    keyboard_dict = {
+                        "inline_keyboard": [
+                            [button.to_dict() for button in row] for row in inline_keyboard
+                        ]
+                    }
+                    keyboard_json = json.dumps(keyboard_dict, separators=(',', ':'), ensure_ascii=False)
+                    json.loads(keyboard_json)  # Валидация
+                    logger.debug(f"Sending reply_markup JSON: {keyboard_json[:200]}...")
+                    data["reply_markup"] = keyboard_json
+                except (TypeError, ValueError) as e:
+                    logger.error(f"Failed to serialize inline keyboard: {e}")
+
+            files = {
+                "video": (
+                    video.filename or "video.mp4",
+                    video.content,
+                    video.content_type or "video/mp4",
+                )
+            }
+            
+            # Добавляем thumbnail, если есть
+            if video.thumbnail:
+                files["thumbnail"] = (
+                    video.thumbnail.filename or "thumbnail.jpg",
+                    video.thumbnail.content,
+                    video.thumbnail.content_type or "image/jpeg",
+                )
+
+            response = self.session.post(
+                f"{self.base_url}/sendVideo",
+                data=data,
+                files=files,
+                timeout=60,  # Видео может быть большим, увеличиваем таймаут
+            )
+
+            if not response.ok:
+                try:
+                    details = response.json()
+                    error_text = details.get("description", response.text)
+                except json.JSONDecodeError:
+                    error_text = response.text
+
+                logger.error("Failed to send video to %s: %s", chat_id, error_text)
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                )
+            
+            return failures
+
+        # Если несколько видео, используем sendMediaGroup
+        # Создаем массив InputMediaVideo
+        media_array = []
+        files_dict = {}
+        
+        for idx, video in enumerate(videos):
+            file_id = f"video_{idx}"
+            media_item = {
+                "type": "video",
+                "media": f"attach://{file_id}",
+            }
+            
+            # Caption только на первом медиа
+            if attach_message and idx == 0:
+                media_item["caption"] = message
+                if parse_mode:
+                    media_item["parse_mode"] = parse_mode
+            
+            # Опциональные параметры видео
+            if video.duration:
+                media_item["duration"] = video.duration
+            if video.width:
+                media_item["width"] = video.width
+            if video.height:
+                media_item["height"] = video.height
+            
+            media_array.append(media_item)
+            
+            # Добавляем файл в files_dict
+            files_dict[file_id] = (
+                video.filename or f"video_{idx}.mp4",
+                video.content,
+                video.content_type or "video/mp4",
+            )
+            
+            # Добавляем thumbnail, если есть
+            if video.thumbnail:
+                thumb_id = f"thumb_{idx}"
+                files_dict[thumb_id] = (
+                    video.thumbnail.filename or f"thumb_{idx}.jpg",
+                    video.thumbnail.content,
+                    video.thumbnail.content_type or "image/jpeg",
+                )
+                media_item["thumbnail"] = f"attach://{thumb_id}"
+        
+        # Подготавливаем данные для запроса
+        data = {
+            "chat_id": chat_id,
+            "media": json.dumps(media_array, separators=(',', ':'), ensure_ascii=False),
+        }
+        
+        if inline_keyboard and (attach_message or attach_keyboard_to_last):
+            logger.warning("Inline keyboard with media group: will be sent separately if needed")
+
+        response = self.session.post(
+            f"{self.base_url}/sendMediaGroup",
+            data=data,
+            files=files_dict,
+            timeout=60,  # Видео может быть большим, увеличиваем таймаут
+        )
+
+        if not response.ok:
+            try:
+                details = response.json()
+                error_text = details.get("description", response.text)
+            except json.JSONDecodeError:
+                error_text = response.text
+
+            logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+            failures.append(
+                DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+            )
+        else:
+            # Если есть inline_keyboard, добавляем его к последнему сообщению в media group
+            if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(videos) > 1)):
                 try:
                     # Получаем ответ от sendMediaGroup, чтобы узнать message_id последнего сообщения
                     response_data = response.json()

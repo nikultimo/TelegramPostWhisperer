@@ -36,6 +36,7 @@ from .telegram_sender import (
     InlineButton,
     TelegramBroadcastConfig,
     TelegramPhoto,
+    TelegramVideo,
     TelegramSender,
     load_chat_ids_from_csv,
 )
@@ -383,6 +384,7 @@ async def send_broadcast(
     csv_file: Optional[UploadFile] = File(None),
     csv_file_name: Optional[str] = Form(None),
     photos: List[UploadFile] = File(default=[]),
+    videos: List[UploadFile] = File(default=[]),
 ):
     # Determine which tokens to use
     tokens_to_use: List[str] = []
@@ -479,6 +481,25 @@ async def send_broadcast(
     else:
         logger.info("No photos received")
 
+    video_objects: List[TelegramVideo] = []
+    if videos:
+        logger.info(f"Received {len(videos)} video(s)")
+        for upload in videos:
+            content = await upload.read()
+            if not content:
+                logger.warning(f"Empty video file: {upload.filename}")
+                continue
+            logger.info(f"Processing video: {upload.filename}, size: {len(content)} bytes")
+            video_objects.append(
+                TelegramVideo(
+                    filename=upload.filename or "video.mp4",
+                    content=content,
+                    content_type=upload.content_type or "video/mp4",
+                )
+            )
+    else:
+        logger.info("No videos received")
+
     keyboard_rows: Optional[List[List[InlineButton]]] = None
     if inline_keyboard:
         try:
@@ -517,8 +538,10 @@ async def send_broadcast(
             parse_mode=normalized_parse_mode,
             disable_web_page_preview=disable_web_page_preview,
             inline_keyboard=keyboard_rows,
-            photos=photo_objects,
+            photos=photo_objects if photo_objects else None,
+            videos=video_objects if video_objects else None,
             attach_message_to_first_photo=attach_message_to_first_photo,
+            attach_message_to_first_video=attach_message_to_first_photo,  # Используем тот же флаг для видео
             extra_api_params=extra_params,
         )
 

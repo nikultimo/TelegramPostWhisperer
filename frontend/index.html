@@ -130,6 +130,22 @@
           </fieldset>
 
           <fieldset class="field-block">
+            <label for="videos">Видео (необязательно)</label>
+            <input
+              type="file"
+              id="videos"
+              name="videos"
+              accept="video/*"
+              multiple
+            />
+            <p class="helper">
+              Добавьте видео файлы. Можно загрузить несколько видео.
+              Удалите лишнее кликом по ×.
+            </p>
+            <div id="video-preview" class="photo-preview"></div>
+          </fieldset>
+
+          <fieldset class="field-block">
             <legend>Инлайн-кнопки</legend>
             <div id="inline-builder" class="inline-builder"></div>
             <div class="inline-actions">
@@ -173,6 +189,7 @@
           <div class="message-bubble">
             <div id="preview-text" class="message-text"></div>
             <div id="preview-photos" class="preview-photos"></div>
+            <div id="preview-videos" class="preview-photos"></div>
             <div id="preview-buttons" class="preview-buttons"></div>
           </div>
         </article>

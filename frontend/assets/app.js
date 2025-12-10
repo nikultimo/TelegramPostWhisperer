@@ -10,6 +10,7 @@ const form = document.getElementById("broadcast-form");
 const messageInput = document.getElementById("message");
 const previewText = document.getElementById("preview-text");
 const previewPhotos = document.getElementById("preview-photos");
+const previewVideos = document.getElementById("preview-videos");
 const previewButtons = document.getElementById("preview-buttons");
 const parseModeSelect = document.getElementById("parse-mode");
 const parseModeInput = document.getElementById("parse-mode-input");
@@ -21,13 +22,16 @@ const buttonTemplate = document.getElementById("button-template");
 const rowTemplate = document.getElementById("inline-row-template");
 const csvSummary = document.getElementById("csv-summary");
 const photosInput = document.getElementById("photos");
+const videosInput = document.getElementById("videos");
 const resultBox = document.getElementById("result");
 const disablePreviewCheckbox = document.getElementById("disable-preview");
 const attachCaptionCheckbox = document.getElementById("attach-caption");
 const enhanceButton = document.getElementById("enhance-button");
 
 const photoObjectUrls = new Set();
+const videoObjectUrls = new Set();
 let currentPhotos = [];
+let currentVideos = [];
 let availableBots = [];
 let availableCsvFiles = [];
 const botSelectionContainer = document.getElementById("bot-selection-container");
@@ -164,6 +168,7 @@ if (enhanceButton) {
 
 csvInput.addEventListener("change", handleCsvChange);
 photosInput.addEventListener("change", handlePhotoChange);
+videosInput.addEventListener("change", handleVideoChange);
 
 addRowButton.addEventListener("click", () => {
   const row = createRow();
@@ -249,6 +254,11 @@ form.addEventListener("submit", async (event) => {
   formData.delete("photos");
   currentPhotos.forEach((file) => {
     formData.append("photos", file, file.name);
+  });
+
+  formData.delete("videos");
+  currentVideos.forEach((file) => {
+    formData.append("videos", file, file.name);
   });
 
   try {
@@ -420,6 +430,11 @@ function handlePhotoChange() {
   renderPhotoPreview();
 }
 
+function handleVideoChange() {
+  currentVideos = Array.from(videosInput.files);
+  renderVideoPreview();
+}
+
 async function createFreshFile(file) {
   const buffer = await file.arrayBuffer();
   return new File([buffer], file.name, { type: file.type || "text/csv" });
@@ -451,7 +466,8 @@ function renderPhotoPreview() {
     removeBtn.className = "remove-photo";
     removeBtn.textContent = "×";
     removeBtn.dataset.index = String(index);
-    removeBtn.addEventListener("click", onRemovePhotoClick);
+    removeBtn.dataset.type = "photo";
+    removeBtn.addEventListener("click", onRemoveMediaClick);
 
     tile.append(img, removeBtn);
     previewPhotos.appendChild(tile);
@@ -465,16 +481,75 @@ function renderPhotoPreview() {
   }
 }
 
-function onRemovePhotoClick(event) {
+function renderVideoPreview() {
+  videoObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+  videoObjectUrls.clear();
+  previewVideos.innerHTML = "";
+
+  const dataTransfer =
+    typeof DataTransfer !== "undefined" ? new DataTransfer() : null;
+  currentVideos.forEach((file, index) => {
+    if (dataTransfer) {
+      dataTransfer.items.add(file);
+    }
+    const url = URL.createObjectURL(file);
+    videoObjectUrls.add(url);
+
+    const tile = document.createElement("div");
+    tile.className = "photo-tile";
+
+    const video = document.createElement("video");
+    video.src = url;
+    video.controls = true;
+    video.style.maxWidth = "100%";
+    video.style.maxHeight = "200px";
+
+    const nameLabel = document.createElement("div");
+    nameLabel.textContent = file.name;
+    nameLabel.style.fontSize = "0.8rem";
+    nameLabel.style.marginTop = "0.5rem";
+    nameLabel.style.color = "#999";
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "remove-photo";
+    removeBtn.textContent = "×";
+    removeBtn.dataset.index = String(index);
+    removeBtn.dataset.type = "video";
+    removeBtn.addEventListener("click", onRemoveMediaClick);
+
+    tile.append(video, nameLabel, removeBtn);
+    previewVideos.appendChild(tile);
+  });
+
+  if (dataTransfer) {
+    videosInput.files = dataTransfer.files;
+  }
+  if (currentVideos.length === 0) {
+    videosInput.value = "";
+  }
+}
+
+function onRemoveMediaClick(event) {
   const index = Number(event.currentTarget.dataset.index);
+  const type = event.currentTarget.dataset.type;
   if (Number.isInteger(index)) {
-    removePhoto(index);
+    if (type === "video") {
+      removeVideo(index);
+    } else {
+      removePhoto(index);
+    }
   }
 }
 
 function removePhoto(index) {
   currentPhotos.splice(index, 1);
   renderPhotoPreview();
+}
+
+function removeVideo(index) {
+  currentVideos.splice(index, 1);
+  renderVideoPreview();
 }
 
 function handlePaste(event) {
