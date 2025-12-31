@@ -433,18 +433,68 @@ class TelegramSender:
             timeout=30,
         )
 
+        # Обработка ошибок с retry без parse_mode при ошибках парсинга entities
         if not response.ok:
             try:
                 details = response.json()
                 error_text = details.get("description", response.text)
+                
+                # Если ошибка связана с парсингом entities, пробуем отправить без parse_mode
+                if "can't parse" in error_text.lower() and "entities" in error_text.lower() and parse_mode:
+                    logger.warning("Entity parsing error detected, retrying without parse_mode for chat_id %s", chat_id)
+                    # Создаем новый media_array без parse_mode
+                    media_array_no_parse = []
+                    for idx, photo in enumerate(photos):
+                        file_id = f"photo_{idx}"
+                        media_item = {
+                            "type": "photo",
+                            "media": f"attach://{file_id}",
+                        }
+                        if attach_message and idx == 0:
+                            media_item["caption"] = message
+                            # Не добавляем parse_mode
+                        media_array_no_parse.append(media_item)
+                    
+                    data_no_parse = {
+                        "chat_id": chat_id,
+                        "media": json.dumps(media_array_no_parse, separators=(',', ':'), ensure_ascii=False),
+                    }
+                    
+                    retry_response = self.session.post(
+                        f"{self.base_url}/sendMediaGroup",
+                        data=data_no_parse,
+                        files=files_dict,
+                        timeout=30,
+                    )
+                    
+                    if retry_response.ok:
+                        logger.info("Successfully sent media group without parse_mode for chat_id %s", chat_id)
+                        # Продолжаем обработку inline_keyboard как обычно
+                        response = retry_response
+                    else:
+                        # Если и без parse_mode не получилось, возвращаем исходную ошибку
+                        logger.error("Failed to send media group even without parse_mode to %s: %s", chat_id, retry_response.text)
+                        failures.append(
+                            DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                        )
+                        return failures
+                else:
+                    # Обычная ошибка, не связанная с парсингом entities
+                    logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                    failures.append(
+                        DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                    )
+                    return failures
             except json.JSONDecodeError:
                 error_text = response.text
+                logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                )
+                return failures
 
-            logger.error("Failed to send media group to %s: %s", chat_id, error_text)
-            failures.append(
-                DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
-            )
-        else:
+        # Обработка inline_keyboard (выполняется как при успешной отправке, так и после успешного retry)
+        if response.ok:
             # Если есть inline_keyboard, добавляем его к последнему сообщению в media group
             if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(photos) > 1)):
                 try:
@@ -644,18 +694,77 @@ class TelegramSender:
             timeout=60,  # Видео может быть большим, увеличиваем таймаут
         )
 
+        # Обработка ошибок с retry без parse_mode при ошибках парсинга entities
         if not response.ok:
             try:
                 details = response.json()
                 error_text = details.get("description", response.text)
+                
+                # Если ошибка связана с парсингом entities, пробуем отправить без parse_mode
+                if "can't parse" in error_text.lower() and "entities" in error_text.lower() and parse_mode:
+                    logger.warning("Entity parsing error detected, retrying without parse_mode for chat_id %s", chat_id)
+                    # Создаем новый media_array без parse_mode
+                    media_array_no_parse = []
+                    for idx, video in enumerate(videos):
+                        file_id = f"video_{idx}"
+                        media_item = {
+                            "type": "video",
+                            "media": f"attach://{file_id}",
+                        }
+                        if attach_message and idx == 0:
+                            media_item["caption"] = message
+                            # Не добавляем parse_mode
+                        
+                        # Опциональные параметры видео
+                        if video.duration:
+                            media_item["duration"] = video.duration
+                        if video.width:
+                            media_item["width"] = video.width
+                        if video.height:
+                            media_item["height"] = video.height
+                        
+                        media_array_no_parse.append(media_item)
+                    
+                    data_no_parse = {
+                        "chat_id": chat_id,
+                        "media": json.dumps(media_array_no_parse, separators=(',', ':'), ensure_ascii=False),
+                    }
+                    
+                    retry_response = self.session.post(
+                        f"{self.base_url}/sendMediaGroup",
+                        data=data_no_parse,
+                        files=files_dict,
+                        timeout=60,
+                    )
+                    
+                    if retry_response.ok:
+                        logger.info("Successfully sent media group without parse_mode for chat_id %s", chat_id)
+                        # Продолжаем обработку inline_keyboard как обычно
+                        response = retry_response
+                    else:
+                        # Если и без parse_mode не получилось, возвращаем исходную ошибку
+                        logger.error("Failed to send media group even without parse_mode to %s: %s", chat_id, retry_response.text)
+                        failures.append(
+                            DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                        )
+                        return failures
+                else:
+                    # Обычная ошибка, не связанная с парсингом entities
+                    logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                    failures.append(
+                        DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                    )
+                    return failures
             except json.JSONDecodeError:
                 error_text = response.text
+                logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                )
+                return failures
 
-            logger.error("Failed to send media group to %s: %s", chat_id, error_text)
-            failures.append(
-                DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
-            )
-        else:
+        # Обработка inline_keyboard (выполняется как при успешной отправке, так и после успешного retry)
+        if response.ok:
             # Если есть inline_keyboard, добавляем его к последнему сообщению в media group
             if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(videos) > 1)):
                 try:
