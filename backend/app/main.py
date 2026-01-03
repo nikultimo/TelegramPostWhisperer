@@ -42,6 +42,12 @@ from .telegram_sender import (
     save_blocked_users,
     load_blocked_users,
 )
+from .settings import (
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_MODEL,
+    get_openrouter_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -216,7 +222,7 @@ async def generate_preview(payload: PreviewPayload) -> dict:
 @app.post("/api/enhance", tags=["messaging"])
 async def enhance_message(payload: EnhancePayload) -> dict:
     """
-    Enhance message text using AI, preserving Telegram Markdown formatting.
+    Enhance message text using OpenRouter AI, preserving Telegram Markdown formatting.
     Also summarizes text if it exceeds Telegram limits:
     - Media caption limit: 1,024 characters (can be extended to 4,096 with sendMessage)
     - Regular message limit: 4,096 characters
@@ -226,41 +232,50 @@ async def enhance_message(payload: EnhancePayload) -> dict:
     if not payload.message or not payload.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.error("OPENAI_API_KEY is not set")
+    if not OPENROUTER_API_KEY:
+        logger.error("OPENROUTER_API_KEY is not set")
         raise HTTPException(
             status_code=500,
-            detail="OPENAI_API_KEY environment variable is not set. Please set it in .env file or environment variables."
+            detail="OPENROUTER_API_KEY environment variable is not set. Please set it in .env file or environment variables."
         )
 
-    # Поддержка настройки BASE_URL (для OpenRouter и других совместимых API)
-    base_url = os.getenv("OPENAI_BASE_URL")
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    # OpenRouter API settings
+    base_url = OPENROUTER_BASE_URL
+    model = OPENROUTER_MODEL
     
-    logger.info(f"Using model: {model}, base_url: {base_url or 'default'}")
+    # Получаем заголовки для OpenRouter (HTTP-Referer и X-Title)
+    openrouter_headers = get_openrouter_headers()
+    
+    logger.info(f"Using OpenRouter model: {model}, base_url: {base_url}")
+    if openrouter_headers:
+        logger.info(f"Using OpenRouter attribution headers: {list(openrouter_headers.keys())}")
 
     try:
-        # Создаем клиент с опциональным base_url
-        # Для совместимости с OpenRouter и другими API
-        # Используем явную передачу параметров для избежания конфликтов
+        # Создаем OpenRouter клиент (используя OpenAI-совместимый API)
+        # OpenRouter использует OpenAI-совместимый протокол
         try:
-            if base_url:
-                logger.info(f"Creating OpenAI client with custom base_url: {base_url}")
+            client_kwargs = {
+                "api_key": OPENROUTER_API_KEY,
+                "base_url": base_url,
+            }
+            
+            logger.info(f"Creating OpenRouter client with base_url: {base_url}")
+            
+            # Добавляем заголовки для OpenRouter (HTTP-Referer и X-Title)
+            if openrouter_headers:
+                client_kwargs["default_headers"] = openrouter_headers
+                logger.info(f"Adding OpenRouter attribution headers: {openrouter_headers}")
+            
+            client = OpenAI(**client_kwargs)
+        except TypeError as e:
+            # Если возникает ошибка с параметрами, пробуем без заголовков
+            logger.warning(f"Error creating OpenRouter client with headers: {e}, trying without headers")
+            if "default_headers" in str(e):
                 client = OpenAI(
-                    api_key=api_key,
+                    api_key=OPENROUTER_API_KEY,
                     base_url=base_url,
                 )
-            else:
-                logger.info("Creating OpenAI client with default base_url")
-                client = OpenAI(api_key=api_key)
-        except TypeError as e:
-            # Если возникает ошибка с параметрами, пробуем без base_url
-            logger.warning(f"Error creating client with base_url: {e}, trying without base_url")
-            if "base_url" in str(e) or "proxies" in str(e):
-                client = OpenAI(api_key=api_key)
-                if base_url:
-                    logger.warning(f"base_url {base_url} will be ignored due to client initialization error")
+                logger.warning(f"OpenRouter headers will be ignored due to client initialization error")
             else:
                 raise
         
@@ -381,12 +396,12 @@ async def enhance_message(payload: EnhancePayload) -> dict:
         
         response = await run_in_threadpool(create_completion)
         
-        logger.info(f"OpenAI API response received, choices count: {len(response.choices) if response.choices else 0}")
+        logger.info(f"OpenRouter API response received, choices count: {len(response.choices) if response.choices else 0}")
 
         if not response.choices or len(response.choices) == 0:
             raise HTTPException(
                 status_code=500,
-                detail="OpenAI API returned no choices in response"
+                detail="OpenRouter API returned no choices in response"
             )
         
         enhanced_text = response.choices[0].message.content.strip()
@@ -394,7 +409,7 @@ async def enhance_message(payload: EnhancePayload) -> dict:
         if not enhanced_text:
             raise HTTPException(
                 status_code=500,
-                detail="OpenAI API returned empty enhanced text"
+                detail="OpenRouter API returned empty enhanced text"
             )
         
         # Проверяем, что результат не превышает лимиты
@@ -447,11 +462,11 @@ async def enhance_message(payload: EnhancePayload) -> dict:
         error_msg = str(exc)
         # Улучшаем сообщение об ошибке для пользователя
         if "api key" in error_msg.lower() or "authentication" in error_msg.lower():
-            error_msg = "Invalid API key. Please check your OPENAI_API_KEY."
+            error_msg = "Invalid API key. Please check your OPENROUTER_API_KEY."
         elif "rate limit" in error_msg.lower():
             error_msg = "Rate limit exceeded. Please try again later."
         elif "insufficient_quota" in error_msg.lower():
-            error_msg = "Insufficient quota. Please check your OpenAI account balance."
+            error_msg = "Insufficient quota. Please check your OpenRouter account balance."
         raise HTTPException(
             status_code=500,
             detail=f"Failed to enhance message: {error_msg}"
