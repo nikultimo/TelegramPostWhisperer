@@ -31,6 +31,29 @@ def _format_exception(e: Exception) -> str:
     return f"{type(e).__name__} (no message)"
 
 
+async def _handle_rate_limit(response: aiohttp.ClientResponse) -> Optional[int]:
+    """
+    Обрабатывает ошибку rate limit (429) и возвращает количество секунд для ожидания.
+    
+    Args:
+        response: HTTP ответ от Telegram API
+        
+    Returns:
+        Количество секунд для ожидания (из заголовка Retry-After) или None, если это не rate limit ошибка
+    """
+    if response.status == 429:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return int(retry_after)
+            except (ValueError, TypeError):
+                # Если не удалось распарсить, возвращаем значение по умолчанию
+                return 60
+        # Если заголовка нет, возвращаем значение по умолчанию
+        return 60
+    return None
+
+
 @dataclass(slots=True)
 class InlineButton:
     text: str
@@ -656,8 +679,8 @@ class TelegramSender:
         chat_ids: Iterable[Union[int, str]],
         config: TelegramBroadcastConfig,
         *,
-        max_concurrent: int = 50,
-        rate_limit_per_second: float = 30.0,
+        max_concurrent: int = 20,
+        rate_limit_per_second: float = 20.0,
     ) -> BroadcastSummary:
         """
         Асинхронная версия broadcast с параллельной отправкой сообщений.
@@ -1673,6 +1696,21 @@ class TelegramSender:
                     if response.ok:
                         return DeliveryReport(chat_id=chat_id, ok=True)
 
+                    # Проверяем rate limit (429)
+                    retry_after_seconds = await _handle_rate_limit(response)
+                    if retry_after_seconds is not None:
+                        if attempt < max_retries - 1:
+                            logger.warning(
+                                "Rate limit (429) sending message to %s (attempt %d/%d): retry after %d seconds",
+                                chat_id, attempt + 1, max_retries, retry_after_seconds
+                            )
+                            await asyncio.sleep(retry_after_seconds)
+                            continue  # Повторяем попытку
+                        else:
+                            error_text = f"Too Many Requests: retry after {retry_after_seconds}"
+                            logger.error("Rate limit sending message to %s after %d attempts: %s", chat_id, max_retries, error_text)
+                            return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+
                     try:
                         details = await response.json()
                         error_text = details.get("description", await response.text())
@@ -1813,6 +1851,22 @@ class TelegramSender:
                             success = True
                             break
                         
+                        # Проверяем rate limit (429)
+                        retry_after_seconds = await _handle_rate_limit(response)
+                        if retry_after_seconds is not None:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    "Rate limit (429) sending photo to %s (attempt %d/%d): retry after %d seconds",
+                                    chat_id, attempt + 1, max_retries, retry_after_seconds
+                                )
+                                await asyncio.sleep(retry_after_seconds)
+                                continue  # Повторяем попытку
+                            else:
+                                error_text = f"Too Many Requests: retry after {retry_after_seconds}"
+                                logger.error("Rate limit sending photo to %s after %d attempts: %s", chat_id, max_retries, error_text)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        
                         try:
                             details = await response.json()
                             error_text = details.get("description", await response.text())
@@ -1941,6 +1995,22 @@ class TelegramSender:
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if not response.ok:
+                        # Проверяем rate limit (429)
+                        retry_after_seconds = await _handle_rate_limit(response)
+                        if retry_after_seconds is not None:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    "Rate limit (429) sending media group to %s (attempt %d/%d): retry after %d seconds",
+                                    chat_id, attempt + 1, max_retries, retry_after_seconds
+                                )
+                                await asyncio.sleep(retry_after_seconds)
+                                continue  # Повторяем попытку
+                            else:
+                                error_text = f"Too Many Requests: retry after {retry_after_seconds}"
+                                logger.error("Rate limit sending media group to %s after %d attempts: %s", chat_id, max_retries, error_text)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        
                         try:
                             details = await response.json()
                             error_text = details.get("description", await response.text())
@@ -2159,6 +2229,22 @@ class TelegramSender:
                             success = True
                             break
                         
+                        # Проверяем rate limit (429)
+                        retry_after_seconds = await _handle_rate_limit(response)
+                        if retry_after_seconds is not None:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    "Rate limit (429) sending video to %s (attempt %d/%d): retry after %d seconds",
+                                    chat_id, attempt + 1, max_retries, retry_after_seconds
+                                )
+                                await asyncio.sleep(retry_after_seconds)
+                                continue  # Повторяем попытку
+                            else:
+                                error_text = f"Too Many Requests: retry after {retry_after_seconds}"
+                                logger.error("Rate limit sending video to %s after %d attempts: %s", chat_id, max_retries, error_text)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        
                         try:
                             details = await response.json()
                             error_text = details.get("description", await response.text())
@@ -2309,6 +2395,22 @@ class TelegramSender:
                     timeout=aiohttp.ClientTimeout(total=timeout),
                 ) as response:
                     if not response.ok:
+                        # Проверяем rate limit (429)
+                        retry_after_seconds = await _handle_rate_limit(response)
+                        if retry_after_seconds is not None:
+                            if attempt < max_retries - 1:
+                                logger.warning(
+                                    "Rate limit (429) sending media group to %s (attempt %d/%d): retry after %d seconds",
+                                    chat_id, attempt + 1, max_retries, retry_after_seconds
+                                )
+                                await asyncio.sleep(retry_after_seconds)
+                                continue  # Повторяем попытку
+                            else:
+                                error_text = f"Too Many Requests: retry after {retry_after_seconds}"
+                                logger.error("Rate limit sending media group to %s after %d attempts: %s", chat_id, max_retries, error_text)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        
                         try:
                             details = await response.json()
                             error_text = details.get("description", await response.text())
