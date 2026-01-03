@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import csv
+import hashlib
 import io
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Iterable, List, Optional, Sequence, Tuple, Union
 
+import aiohttp
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -83,12 +89,24 @@ def load_chat_ids_from_csv(
     *,
     column_name: str = "telegram_id",
     encoding: str = "utf-8",
+    filter_blocked: bool = True,
+    bot_token: Optional[str] = None,
 ) -> List[str]:
     """
     Load chat identifiers from a CSV file-like input.
 
     The CSV may contain a column named ``telegram_id`` or provide the IDs in the first column.
     Empty rows and malformed entries are skipped.
+    
+    Args:
+        csv_source: CSV file path, bytes, or file-like object
+        column_name: Name of the column containing telegram IDs
+        encoding: Text encoding for the CSV file
+        filter_blocked: If True, filter out blocked users from blocked_users.csv
+        bot_token: Bot token to filter blocked users for (required if filter_blocked=True)
+    
+    Returns:
+        List of chat IDs (as strings), with blocked users filtered out if filter_blocked=True
     """
 
     if isinstance(csv_source, (str, Path)):
@@ -112,11 +130,22 @@ def load_chat_ids_from_csv(
     header = [cell.strip() for cell in rows[0]]
     data_rows = rows[1:] if _looks_like_header(header, column_name) else rows
 
+    # Load blocked users if filtering is enabled
+    blocked_users: set[str] = set()
+    if filter_blocked:
+        if not bot_token:
+            logger.warning("filter_blocked=True but bot_token not provided, skipping blocked user filtering")
+        else:
+            blocked_users = load_blocked_users(bot_token)
+            if blocked_users:
+                logger.info(f"Filtering out {len(blocked_users)} blocked user(s) for bot token")
+
     ids: List[str] = []
     column_idx = (
         header.index(column_name) if header and column_name in header else 0
     )
 
+    filtered_count = 0
     for row in data_rows:
         if not row:
             continue
@@ -132,7 +161,16 @@ def load_chat_ids_from_csv(
 
         # Keep original string to preserve large integers and negative IDs
         normalized = raw_value.replace(" ", "")
+        
+        # Filter out blocked users
+        if filter_blocked and normalized in blocked_users:
+            filtered_count += 1
+            continue
+        
         ids.append(normalized)
+
+    if filter_blocked and filtered_count > 0:
+        logger.info(f"Filtered out {filtered_count} blocked user(s) from CSV")
 
     return ids
 
@@ -144,12 +182,169 @@ def _looks_like_header(header: Sequence[str], column_name: str) -> bool:
     return column_name.lower() in normalized
 
 
+def _get_token_hash(token: str) -> str:
+    """
+    Generate a hash of the bot token for use in filenames.
+    Uses SHA256 and returns first 16 characters for readability.
+    """
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def get_blocked_users_file_path(token: str) -> Path:
+    """
+    Get the path to the blocked users CSV file for a specific bot token.
+    Tries multiple possible locations (project root/data/blocked_users, Docker /app/data/blocked_users, current directory/data/blocked_users).
+    
+    Args:
+        token: Bot token to generate unique filename
+    
+    Returns:
+        Path to the blocked users CSV file for this bot
+    """
+    token_hash = _get_token_hash(token)
+    filename = f"blocked_users_{token_hash}.csv"
+    
+    possible_paths = [
+        Path(__file__).resolve().parents[2] / "data" / "blocked_users" / filename,  # Project root/data/blocked_users
+        Path("/app/data") / "blocked_users" / filename,  # Docker container path
+        Path("data") / "blocked_users" / filename,  # Current working directory/data/blocked_users
+    ]
+    
+    for path in possible_paths:
+        if path.parent.exists():
+            return path
+    
+    # Return the first path if none exist (will create directory if needed)
+    return possible_paths[0]
+
+
+def load_blocked_users(token: str) -> set[str]:
+    """
+    Load blocked user IDs from the blocked_users CSV file for a specific bot token.
+    
+    Args:
+        token: Bot token to load blocked users for
+    
+    Returns:
+        Set of blocked user IDs (as strings).
+    """
+    blocked_file = get_blocked_users_file_path(token)
+    
+    if not blocked_file.exists():
+        logger.debug(f"Blocked users file not found at {blocked_file}, returning empty set")
+        return set()
+    
+    try:
+        blocked_ids = set()
+        with open(blocked_file, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            
+            if not rows:
+                return set()
+            
+            # Check if first row is a header
+            header = [cell.strip() for cell in rows[0]]
+            data_rows = rows[1:] if _looks_like_header(header, "telegram_id") else rows
+            
+            column_idx = (
+                header.index("telegram_id") if header and "telegram_id" in header else 0
+            )
+            
+            for row in data_rows:
+                if not row:
+                    continue
+                try:
+                    raw_value = row[column_idx].strip()
+                    if raw_value:
+                        normalized = raw_value.replace(" ", "")
+                        blocked_ids.add(normalized)
+                except (IndexError, ValueError):
+                    continue
+        
+        logger.info(f"Loaded {len(blocked_ids)} blocked user(s) from {blocked_file}")
+        return blocked_ids
+    except Exception as e:
+        logger.error(f"Failed to load blocked users from {blocked_file}: {e}")
+        return set()
+
+
+def save_blocked_users(token: str, blocked_ids: set[str]) -> None:
+    """
+    Save blocked user IDs to the blocked_users CSV file for a specific bot token.
+    Appends new blocked users to the existing file (if any).
+    
+    Args:
+        token: Bot token to save blocked users for
+        blocked_ids: Set of blocked user IDs to save
+    """
+    if not blocked_ids:
+        logger.debug("No blocked users to save")
+        return
+    
+    blocked_file = get_blocked_users_file_path(token)
+    
+    # Load existing blocked users to avoid duplicates
+    existing_blocked = load_blocked_users(token)
+    
+    # Merge with new blocked users
+    all_blocked = existing_blocked | blocked_ids
+    
+    # Only save if there are new blocked users
+    new_blocked = blocked_ids - existing_blocked
+    if not new_blocked:
+        logger.debug("No new blocked users to save")
+        return
+    
+    try:
+        # Ensure directory exists
+        blocked_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write all blocked users (existing + new)
+        with open(blocked_file, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["telegram_id"])  # Header
+            for user_id in sorted(all_blocked, key=lambda x: (len(x), x)):
+                writer.writerow([user_id])
+        
+        logger.info(f"Saved {len(new_blocked)} new blocked user(s) to {blocked_file} (total: {len(all_blocked)})")
+    except OSError as e:
+        # Handle read-only filesystem gracefully
+        if e.errno == 30:  # Read-only file system
+            logger.warning(
+                f"Cannot save blocked users to {blocked_file}: filesystem is read-only. "
+                f"{len(new_blocked)} blocked user(s) detected but not persisted. "
+                f"Consider mounting /app/data as writable or using a writable volume."
+            )
+        else:
+            logger.error(f"Failed to save blocked users to {blocked_file}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Failed to save blocked users to {blocked_file}: {e}", exc_info=True)
+
+
 class TelegramSender:
     api_host = "https://api.telegram.org"
 
     def __init__(self, token: str, *, session: Optional[requests.Session] = None):
         self.token = token
-        self.session = session or requests.Session()
+        if session is None:
+            session = requests.Session()
+            # Configure retry strategy for SSL and connection errors
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["POST", "GET"],
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(
+                max_retries=retry_strategy,
+                pool_connections=10,
+                pool_maxsize=20,
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+        self.session = session
 
     @property
     def base_url(self) -> str:
@@ -256,6 +451,189 @@ class TelegramSender:
 
         return BroadcastSummary(total=len(chat_ids), delivered=delivered, failed=failed)
 
+    async def broadcast_async(
+        self,
+        chat_ids: Iterable[Union[int, str]],
+        config: TelegramBroadcastConfig,
+        *,
+        max_concurrent: int = 50,
+        rate_limit_per_second: float = 30.0,
+    ) -> BroadcastSummary:
+        """
+        Асинхронная версия broadcast с параллельной отправкой сообщений.
+        
+        Args:
+            chat_ids: Список ID чатов для рассылки
+            config: Конфигурация рассылки
+            max_concurrent: Максимальное количество одновременных запросов (по умолчанию 50)
+            rate_limit_per_second: Максимальное количество запросов в секунду (по умолчанию 30)
+        """
+        chat_ids = list(chat_ids)
+        if not chat_ids:
+            return BroadcastSummary(total=0, delivered=0, failed=[])
+
+        photos = list(config.photos or [])
+        videos = list(config.videos or [])
+        
+        # Для малых батчей (<= 20 пользователей) не применяем строгий rate limiting
+        # Telegram API позволяет небольшие всплески запросов
+        use_rate_limiting = len(chat_ids) > 20
+        
+        # Семафор для ограничения количества одновременных запросов
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        refiller_task = None
+        token_queue = None
+        
+        if use_rate_limiting:
+            # Улучшенный rate limiter с использованием очереди токенов
+            # Это позволяет избежать блокировки всех запросов одним lock
+            min_interval = 1.0 / rate_limit_per_second
+            token_queue = asyncio.Queue(maxsize=int(rate_limit_per_second * 2))
+            
+            # Заполняем очередь токенами
+            for _ in range(int(rate_limit_per_second * 2)):
+                token_queue.put_nowait(None)
+            
+            # Фоновая задача для пополнения токенов
+            async def token_refiller():
+                """Пополняет очередь токенов с нужной частотой"""
+                while True:
+                    await asyncio.sleep(min_interval)
+                    try:
+                        token_queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        pass  # Очередь уже полная, пропускаем
+            
+            # Запускаем refiller как фоновую задачу
+            refiller_task = asyncio.create_task(token_refiller())
+        
+        async def rate_limited_request():
+            """Ожидание для соблюдения rate limit через токены"""
+            if use_rate_limiting and token_queue:
+                await token_queue.get()  # Получаем токен из очереди
+            # Для малых батчей просто пропускаем rate limiting
+        
+        async def send_to_chat(chat_id: Union[int, str]) -> Optional[DeliveryReport]:
+            """Отправка сообщения одному чату"""
+            async with semaphore:
+                await rate_limited_request()
+                
+                try:
+                    if videos:
+                        attach_to_last = not config.attach_message_to_first_video and config.inline_keyboard
+                        media_failures = await self._send_videos_async(
+                            chat_id,
+                            videos,
+                            config.attach_message_to_first_video,
+                            config.message if config.attach_message_to_first_video else "",
+                            config.parse_mode if config.attach_message_to_first_video else None,
+                            config.inline_keyboard if (config.attach_message_to_first_video or attach_to_last) else None,
+                            attach_to_last,
+                        )
+                        if media_failures:
+                            return media_failures[0] if media_failures else None
+                        
+                        if not config.attach_message_to_first_video and config.message:
+                            if attach_to_last:
+                                message_config = TelegramBroadcastConfig(
+                                    token=config.token,
+                                    message=config.message,
+                                    parse_mode=config.parse_mode,
+                                    disable_web_page_preview=config.disable_web_page_preview,
+                                    inline_keyboard=None,
+                                    photos=None,
+                                    videos=None,
+                                    attach_message_to_first_photo=False,
+                                    attach_message_to_first_video=False,
+                                    extra_api_params=config.extra_api_params,
+                                )
+                            else:
+                                message_config = config
+                            message_result = await self._send_message_async(chat_id, message_config)
+                            if not message_result.ok:
+                                return message_result
+                        return None
+                    elif photos:
+                        attach_to_last = not config.attach_message_to_first_photo and config.inline_keyboard
+                        media_failures = await self._send_photos_async(
+                            chat_id,
+                            photos,
+                            config.attach_message_to_first_photo,
+                            config.message if config.attach_message_to_first_photo else "",
+                            config.parse_mode if config.attach_message_to_first_photo else None,
+                            config.inline_keyboard if (config.attach_message_to_first_photo or attach_to_last) else None,
+                            attach_to_last,
+                        )
+                        if media_failures:
+                            return media_failures[0] if media_failures else None
+                        
+                        if not config.attach_message_to_first_photo and config.message:
+                            if attach_to_last:
+                                message_config = TelegramBroadcastConfig(
+                                    token=config.token,
+                                    message=config.message,
+                                    parse_mode=config.parse_mode,
+                                    disable_web_page_preview=config.disable_web_page_preview,
+                                    inline_keyboard=None,
+                                    photos=None,
+                                    attach_message_to_first_photo=False,
+                                    extra_api_params=config.extra_api_params,
+                                )
+                            else:
+                                message_config = config
+                            message_result = await self._send_message_async(chat_id, message_config)
+                            if not message_result.ok:
+                                return message_result
+                        return None
+                    else:
+                        message_result = await self._send_message_async(chat_id, config)
+                        if not message_result.ok:
+                            return message_result
+                        return None
+                except Exception as e:
+                    logger.error(f"Unexpected error sending to {chat_id}: {e}", exc_info=True)
+                    return DeliveryReport(chat_id=chat_id, ok=False, error=f"Unexpected error: {e}")
+        
+        # Создаем сессию aiohttp с оптимизированными настройками
+        connector = aiohttp.TCPConnector(
+            limit=max_concurrent * 2,  # Увеличиваем лимит соединений
+            limit_per_host=max_concurrent,
+            ttl_dns_cache=300,
+            force_close=False,  # Переиспользуем соединения
+        )
+        timeout = aiohttp.ClientTimeout(total=300, connect=30)  # Увеличиваем таймауты для больших файлов
+        try:
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                self._async_session = session
+                
+                # Запускаем все задачи параллельно
+                tasks = [send_to_chat(chat_id) for chat_id in chat_ids]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Обрабатываем результаты
+                failed: List[DeliveryReport] = []
+                delivered = 0
+                
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Task raised exception: {result}", exc_info=True)
+                        continue
+                    if result is not None:
+                        failed.append(result)
+                    else:
+                        delivered += 1
+                
+                return BroadcastSummary(total=len(chat_ids), delivered=delivered, failed=failed)
+        finally:
+            # Останавливаем фоновую задачу пополнения токенов (если она была запущена)
+            if refiller_task:
+                refiller_task.cancel()
+                try:
+                    await refiller_task
+                except asyncio.CancelledError:
+                    pass
+
     def _send_message(
         self,
         chat_id: Union[int, str],
@@ -345,12 +723,46 @@ class TelegramSender:
                 )
             }
 
-            response = self.session.post(
-                f"{self.base_url}/sendPhoto",
-                data=data,
-                files=files,
-                timeout=30,
-            )
+            # Увеличиваем таймаут для больших фото
+            photo_size_mb = len(photo.content) / (1024 * 1024)
+            timeout = 120 if photo_size_mb > 5 else 60 if photo_size_mb > 1 else 30
+            
+            # Retry logic with exponential backoff for SSL/connection errors
+            max_retries = 3
+            retry_delay = 1
+            last_exception = None
+            response = None
+            
+            for attempt in range(max_retries):
+                try:
+                    response = self.session.post(
+                        f"{self.base_url}/sendPhoto",
+                        data=data,
+                        files=files,
+                        timeout=timeout,
+                    )
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        logger.warning(
+                            "Photo send attempt %d/%d failed for chat_id %s: %s. Retrying in %d seconds...",
+                            attempt + 1, max_retries, chat_id, e, wait_time
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        logger.error("Timeout or connection error sending photo to %s after %d attempts: %s", chat_id, max_retries, e)
+                        failures.append(
+                            DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error after {max_retries} attempts: {e}")
+                        )
+                        return failures
+            
+            if last_exception and response is None:
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error: {last_exception}")
+                )
+                return failures
 
             if not response.ok:
                 try:
@@ -426,12 +838,55 @@ class TelegramSender:
             except (TypeError, ValueError) as e:
                 logger.error(f"Failed to serialize inline keyboard: {e}")
 
-        response = self.session.post(
-            f"{self.base_url}/sendMediaGroup",
-            data=data,
-            files=files_dict,
-            timeout=30,
-        )
+        # Вычисляем общий размер файлов для определения таймаута
+        total_size_mb = sum(len(photo.content) for photo in photos) / (1024 * 1024)
+        timeout = 180 if total_size_mb > 10 else 120 if total_size_mb > 5 else 60
+        
+        # Retry logic with exponential backoff for SSL/connection errors
+        max_retries = 3
+        retry_delay = 1
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.session.post(
+                    f"{self.base_url}/sendMediaGroup",
+                    data=data,
+                    files=files_dict,
+                    timeout=timeout,
+                )
+                # If we get a response, break out of retry loop
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        "Attempt %d/%d failed for chat_id %s: %s. Retrying in %d seconds...",
+                        attempt + 1, max_retries, chat_id, e, wait_time
+                    )
+                    time.sleep(wait_time)
+                else:
+                    logger.error("Timeout or connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, e)
+                    failures.append(
+                        DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error after {max_retries} attempts: {e}")
+                    )
+                    return failures
+            except Exception as e:
+                # For other exceptions, don't retry
+                logger.error("Unexpected error sending media group to %s: %s", chat_id, e)
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Unexpected error: {e}")
+                )
+                return failures
+        else:
+            # This executes if the for loop completes without breaking (shouldn't happen, but safety)
+            if last_exception:
+                logger.error("Failed to send media group to %s after all retries: %s", chat_id, last_exception)
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Failed after {max_retries} attempts: {last_exception}")
+                )
+                return failures
 
         # Обработка ошибок с retry без parse_mode при ошибках парсинга entities
         if not response.ok:
@@ -460,14 +915,44 @@ class TelegramSender:
                         "media": json.dumps(media_array_no_parse, separators=(',', ':'), ensure_ascii=False),
                     }
                     
-                    retry_response = self.session.post(
-                        f"{self.base_url}/sendMediaGroup",
-                        data=data_no_parse,
-                        files=files_dict,
-                        timeout=30,
-                    )
+                    # Retry logic for parse_mode retry
+                    max_parse_retries = 2
+                    parse_retry_delay = 1
+                    parse_last_exception = None
+                    retry_response = None
                     
-                    if retry_response.ok:
+                    for parse_attempt in range(max_parse_retries):
+                        try:
+                            retry_response = self.session.post(
+                                f"{self.base_url}/sendMediaGroup",
+                                data=data_no_parse,
+                                files=files_dict,
+                                timeout=timeout,  # Используем тот же таймаут
+                            )
+                            break
+                        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
+                            parse_last_exception = e
+                            if parse_attempt < max_parse_retries - 1:
+                                wait_time = parse_retry_delay * (2 ** parse_attempt)
+                                logger.warning(
+                                    "Parse retry attempt %d/%d failed for chat_id %s: %s. Retrying in %d seconds...",
+                                    parse_attempt + 1, max_parse_retries, chat_id, e, wait_time
+                                )
+                                time.sleep(wait_time)
+                            else:
+                                logger.error("Timeout or connection error on parse retry for chat_id %s: %s", chat_id, e)
+                                failures.append(
+                                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error: {e}")
+                                )
+                                return failures
+                    
+                    if parse_last_exception and retry_response is None:
+                        failures.append(
+                            DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error: {parse_last_exception}")
+                        )
+                        return failures
+                    
+                    if retry_response and retry_response.ok:
                         logger.info("Successfully sent media group without parse_mode for chat_id %s", chat_id)
                         # Продолжаем обработку inline_keyboard как обычно
                         response = retry_response
@@ -612,12 +1097,46 @@ class TelegramSender:
                     video.thumbnail.content_type or "image/jpeg",
                 )
 
-            response = self.session.post(
-                f"{self.base_url}/sendVideo",
-                data=data,
-                files=files,
-                timeout=60,  # Видео может быть большим, увеличиваем таймаут
-            )
+            # Увеличиваем таймаут для больших видео
+            video_size_mb = len(video.content) / (1024 * 1024)
+            timeout = 300 if video_size_mb > 50 else 180 if video_size_mb > 20 else 120
+            
+            # Retry logic with exponential backoff for SSL/connection errors
+            max_retries = 3
+            retry_delay = 1
+            last_exception = None
+            response = None
+            
+            for attempt in range(max_retries):
+                try:
+                    response = self.session.post(
+                        f"{self.base_url}/sendVideo",
+                        data=data,
+                        files=files,
+                        timeout=timeout,
+                    )
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        logger.warning(
+                            "Video send attempt %d/%d failed for chat_id %s: %s. Retrying in %d seconds...",
+                            attempt + 1, max_retries, chat_id, e, wait_time
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        logger.error("Timeout or connection error sending video to %s after %d attempts: %s", chat_id, max_retries, e)
+                        failures.append(
+                            DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error after {max_retries} attempts: {e}")
+                        )
+                        return failures
+            
+            if last_exception and response is None:
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error: {last_exception}")
+                )
+                return failures
 
             if not response.ok:
                 try:
@@ -687,12 +1206,55 @@ class TelegramSender:
         if inline_keyboard and (attach_message or attach_keyboard_to_last):
             logger.warning("Inline keyboard with media group: will be sent separately if needed")
 
-        response = self.session.post(
-            f"{self.base_url}/sendMediaGroup",
-            data=data,
-            files=files_dict,
-            timeout=60,  # Видео может быть большим, увеличиваем таймаут
-        )
+        # Вычисляем общий размер файлов для определения таймаута
+        total_size_mb = sum(len(video.content) for video in videos) / (1024 * 1024)
+        timeout = 300 if total_size_mb > 50 else 180 if total_size_mb > 20 else 120
+        
+        # Retry logic with exponential backoff for SSL/connection errors
+        max_retries = 3
+        retry_delay = 1
+        last_exception = None
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.session.post(
+                    f"{self.base_url}/sendMediaGroup",
+                    data=data,
+                    files=files_dict,
+                    timeout=timeout,
+                )
+                # If we get a response, break out of retry loop
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        "Attempt %d/%d failed for chat_id %s: %s. Retrying in %d seconds...",
+                        attempt + 1, max_retries, chat_id, e, wait_time
+                    )
+                    time.sleep(wait_time)
+                else:
+                    logger.error("Timeout or connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, e)
+                    failures.append(
+                        DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error after {max_retries} attempts: {e}")
+                    )
+                    return failures
+            except Exception as e:
+                # For other exceptions, don't retry
+                logger.error("Unexpected error sending media group to %s: %s", chat_id, e)
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Unexpected error: {e}")
+                )
+                return failures
+        else:
+            # This executes if the for loop completes without breaking (shouldn't happen, but safety)
+            if last_exception:
+                logger.error("Failed to send media group to %s after all retries: %s", chat_id, last_exception)
+                failures.append(
+                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Failed after {max_retries} attempts: {last_exception}")
+                )
+                return failures
 
         # Обработка ошибок с retry без parse_mode при ошибках парсинга entities
         if not response.ok:
@@ -730,20 +1292,50 @@ class TelegramSender:
                         "media": json.dumps(media_array_no_parse, separators=(',', ':'), ensure_ascii=False),
                     }
                     
-                    retry_response = self.session.post(
-                        f"{self.base_url}/sendMediaGroup",
-                        data=data_no_parse,
-                        files=files_dict,
-                        timeout=60,
-                    )
+                    # Retry logic for parse_mode retry
+                    max_parse_retries = 2
+                    parse_retry_delay = 1
+                    parse_last_exception = None
+                    retry_response = None
                     
-                    if retry_response.ok:
+                    for parse_attempt in range(max_parse_retries):
+                        try:
+                            retry_response = self.session.post(
+                                f"{self.base_url}/sendMediaGroup",
+                                data=data_no_parse,
+                                files=files_dict,
+                                timeout=timeout,  # Используем тот же таймаут
+                            )
+                            break
+                        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
+                            parse_last_exception = e
+                            if parse_attempt < max_parse_retries - 1:
+                                wait_time = parse_retry_delay * (2 ** parse_attempt)
+                                logger.warning(
+                                    "Parse retry attempt %d/%d failed for chat_id %s: %s. Retrying in %d seconds...",
+                                    parse_attempt + 1, max_parse_retries, chat_id, e, wait_time
+                                )
+                                time.sleep(wait_time)
+                            else:
+                                logger.error("Timeout or connection error on parse retry for chat_id %s: %s", chat_id, e)
+                                failures.append(
+                                    DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error: {e}")
+                                )
+                                return failures
+                    
+                    if parse_last_exception and retry_response is None:
+                        failures.append(
+                            DeliveryReport(chat_id=chat_id, ok=False, error=f"Timeout or connection error: {parse_last_exception}")
+                        )
+                        return failures
+                    
+                    if retry_response and retry_response.ok:
                         logger.info("Successfully sent media group without parse_mode for chat_id %s", chat_id)
                         # Продолжаем обработку inline_keyboard как обычно
                         response = retry_response
                     else:
                         # Если и без parse_mode не получилось, возвращаем исходную ошибку
-                        logger.error("Failed to send media group even without parse_mode to %s: %s", chat_id, retry_response.text)
+                        logger.error("Failed to send media group even without parse_mode to %s: %s", chat_id, retry_response.text if retry_response else "No response")
                         failures.append(
                             DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
                         )
@@ -818,5 +1410,518 @@ class TelegramSender:
                     except Exception as fallback_error:
                         logger.error(f"Fallback keyboard send also failed: {fallback_error}")
 
+        return failures
+
+
+    async def _send_message_async(
+        self,
+        chat_id: Union[int, str],
+        config: TelegramBroadcastConfig,
+    ) -> DeliveryReport:
+        """Асинхронная версия _send_message"""
+        if not hasattr(self, '_async_session') or self._async_session is None:
+            raise RuntimeError("Async session not initialized. Use broadcast_async() method.")
+        
+        payload = {
+            "chat_id": chat_id,
+            "text": config.message,
+            "disable_web_page_preview": config.disable_web_page_preview,
+        }
+
+        if config.parse_mode:
+            payload["parse_mode"] = config.parse_mode
+
+        if config.inline_keyboard:
+            payload["reply_markup"] = {
+                "inline_keyboard": [
+                    [button.to_dict() for button in row] for row in config.inline_keyboard
+                ]
+            }
+
+        if config.extra_api_params:
+            payload.update(config.extra_api_params)
+
+        # Retry logic для сетевых ошибок
+        max_retries = 3
+        retry_delay = 0.5  # Уменьшено с 1 до 0.5 для более быстрой обработки
+        
+        for attempt in range(max_retries):
+            try:
+                async with self._async_session.post(
+                    f"{self.base_url}/sendMessage",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as response:
+                    if response.ok:
+                        return DeliveryReport(chat_id=chat_id, ok=True)
+
+                    try:
+                        details = await response.json()
+                        error_text = details.get("description", await response.text())
+                    except Exception:
+                        error_text = await response.text()
+
+                    # Для ошибок типа "chat not found" не делаем retry
+                    if "chat not found" in error_text.lower() or "chat_id" in error_text.lower():
+                        logger.warning("Failed to send message to %s: %s (no retry)", chat_id, error_text)
+                        return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                    
+                    # Для других ошибок API тоже не делаем retry
+                    logger.error("Failed to send message to %s: %s", chat_id, error_text)
+                    return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+            except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        "Connection error sending message to %s (attempt %d/%d): %s. Retrying in %d seconds...",
+                        chat_id, attempt + 1, max_retries, e, wait_time
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    error_text = f"Connection error after {max_retries} attempts: {e}"
+                    logger.error("Connection error sending message to %s after %d attempts: %s", chat_id, max_retries, e)
+                    return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+            except Exception as e:
+                error_text = f"Unexpected error: {e}"
+                logger.error("Unexpected error sending message to %s: %s", chat_id, e, exc_info=True)
+                return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+        
+        # Fallback (не должно достигнуться)
+        return DeliveryReport(chat_id=chat_id, ok=False, error="Failed after all retries")
+    async def _send_photos_async(
+        self,
+        chat_id: Union[int, str],
+        photos: Sequence[TelegramPhoto],
+        attach_message: bool,
+        message: str,
+        parse_mode: Optional[str],
+        inline_keyboard: Optional[List[List[InlineButton]]],
+        attach_keyboard_to_last: bool = False,
+    ) -> List[DeliveryReport]:
+        """Асинхронная версия _send_photos"""
+        failures: List[DeliveryReport] = []
+
+        if not photos:
+            return failures
+
+        if not hasattr(self, '_async_session') or self._async_session is None:
+            raise RuntimeError("Async session not initialized. Use broadcast_async() method.")
+
+        if len(photos) == 1:
+            photo = photos[0]
+            timeout = 120 if len(photo.content) / (1024 * 1024) > 5 else 60 if len(photo.content) / (1024 * 1024) > 1 else 30
+            
+            # Retry logic для сетевых ошибок
+            max_retries = 3
+            retry_delay = 1
+            success = False
+            
+            for attempt in range(max_retries):
+                # Recreate FormData for each retry attempt (FormData can only be processed once)
+                data = aiohttp.FormData()
+                data.add_field("chat_id", str(chat_id))
+                
+                if attach_message:
+                    data.add_field("caption", message)
+                    if parse_mode:
+                        data.add_field("parse_mode", parse_mode)
+                
+                if inline_keyboard:
+                    try:
+                        keyboard_dict = {
+                            "inline_keyboard": [
+                                [button.to_dict() for button in row] for row in inline_keyboard
+                            ]
+                        }
+                        keyboard_json = json.dumps(keyboard_dict, separators=(',', ':'), ensure_ascii=False)
+                        data.add_field("reply_markup", keyboard_json)
+                    except (TypeError, ValueError) as e:
+                        logger.error(f"Failed to serialize inline keyboard: {e}")
+
+                data.add_field("photo", photo.content, filename=photo.filename or "photo.jpg", content_type=photo.content_type or "image/jpeg")
+                
+                try:
+                    async with self._async_session.post(
+                        f"{self.base_url}/sendPhoto",
+                        data=data,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                    ) as response:
+                        if response.ok:
+                            success = True
+                            break
+                        
+                        try:
+                            details = await response.json()
+                            error_text = details.get("description", await response.text())
+                        except Exception:
+                            error_text = await response.text()
+                        
+                        # Для ошибок типа "chat not found" не делаем retry
+                        if "chat not found" in error_text.lower() or "chat_id" in error_text.lower():
+                            logger.warning("Failed to send photo to %s: %s (no retry)", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
+                        
+                        # Для других ошибок API тоже не делаем retry
+                        logger.error("Failed to send photo to %s: %s", chat_id, error_text)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                        return failures
+                except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        logger.warning(
+                            "Connection error sending photo to %s (attempt %d/%d): %s. Retrying in %d seconds...",
+                            chat_id, attempt + 1, max_retries, e, wait_time
+                        )
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error("Connection error sending photo to %s after %d attempts: %s", chat_id, max_retries, e)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                        return failures
+                except Exception as e:
+                    logger.error("Unexpected error sending photo to %s: %s", chat_id, e, exc_info=True)
+                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Unexpected error: {e}"))
+                    return failures
+            
+            if not success:
+                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error="Failed after all retries"))
+            
+            return failures
+
+        # Для нескольких фото используем sendMediaGroup
+        total_size_mb = sum(len(photo.content) for photo in photos) / (1024 * 1024)
+        timeout = 180 if total_size_mb > 10 else 120 if total_size_mb > 5 else 60
+        
+        # Retry logic для сетевых ошибок
+        max_retries = 3
+        retry_delay = 0.5  # Уменьшено с 1 до 0.5 для более быстрой обработки
+        success = False
+        
+        for attempt in range(max_retries):
+            # Recreate FormData for each retry attempt (FormData can only be processed once)
+            media_array = []
+            data = aiohttp.FormData()
+            data.add_field("chat_id", str(chat_id))
+            
+            for idx, photo in enumerate(photos):
+                file_id = f"photo_{idx}"
+                media_item = {
+                    "type": "photo",
+                    "media": f"attach://{file_id}",
+                }
+                
+                if attach_message and idx == 0:
+                    media_item["caption"] = message
+                    if parse_mode:
+                        media_item["parse_mode"] = parse_mode
+                
+                media_array.append(media_item)
+                data.add_field(file_id, photo.content, filename=photo.filename or f"photo_{idx}.jpg", content_type=photo.content_type or "image/jpeg")
+            
+            data.add_field("media", json.dumps(media_array, separators=(',', ':'), ensure_ascii=False))
+            
+            try:
+                async with self._async_session.post(
+                    f"{self.base_url}/sendMediaGroup",
+                    data=data,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    if not response.ok:
+                        try:
+                            details = await response.json()
+                            error_text = details.get("description", await response.text())
+                        except Exception:
+                            error_text = await response.text()
+                        
+                        # Для ошибок типа "chat not found" не делаем retry
+                        if "chat not found" in error_text.lower() or "chat_id" in error_text.lower():
+                            logger.warning("Failed to send media group to %s: %s (no retry)", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
+                        
+                        # Для других ошибок API тоже не делаем retry
+                        logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                        return failures
+                    
+                    success = True
+                    # Обработка inline keyboard
+                    if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(photos) > 1)):
+                        try:
+                            response_data = await response.json()
+                            if response_data.get("ok") and response_data.get("result"):
+                                messages = response_data["result"]
+                                if messages and len(messages) > 0:
+                                    last_message_id = messages[-1].get("message_id")
+                                    keyboard_dict = {
+                                        "inline_keyboard": [
+                                            [button.to_dict() for button in row] for row in inline_keyboard
+                                        ]
+                                    }
+                                    edit_data = {
+                                        "chat_id": chat_id,
+                                        "message_id": last_message_id,
+                                        "reply_markup": keyboard_dict,
+                                    }
+                                    async with self._async_session.post(
+                                        f"{self.base_url}/editMessageReplyMarkup",
+                                        json=edit_data,
+                                        timeout=aiohttp.ClientTimeout(total=15),
+                                    ) as edit_response:
+                                        if not edit_response.ok:
+                                            logger.warning("Failed to add inline keyboard to last message in media group")
+                        except Exception as e:
+                            logger.error(f"Error adding inline keyboard to media group: {e}")
+                    break  # Успешно отправили, выходим из цикла retry
+            except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        "Connection error sending media group to %s (attempt %d/%d): %s. Retrying in %d seconds...",
+                        chat_id, attempt + 1, max_retries, e, wait_time
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error("Connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, e)
+                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                    return failures
+            except Exception as e:
+                logger.error("Unexpected error sending media group to %s: %s", chat_id, e, exc_info=True)
+                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Unexpected error: {e}"))
+                return failures
+        
+        if not success:
+            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error="Failed after all retries"))
+        
+        return failures
+
+    async def _send_videos_async(
+        self,
+        chat_id: Union[int, str],
+        videos: Sequence[TelegramVideo],
+        attach_message: bool,
+        message: str,
+        parse_mode: Optional[str],
+        inline_keyboard: Optional[List[List[InlineButton]]],
+        attach_keyboard_to_last: bool = False,
+    ) -> List[DeliveryReport]:
+        """Асинхронная версия _send_videos"""
+        failures: List[DeliveryReport] = []
+
+        if not videos:
+            return failures
+
+        if not hasattr(self, '_async_session') or self._async_session is None:
+            raise RuntimeError("Async session not initialized. Use broadcast_async() method.")
+
+        if len(videos) == 1:
+            video = videos[0]
+            video_size_mb = len(video.content) / (1024 * 1024)
+            timeout = 300 if video_size_mb > 50 else 180 if video_size_mb > 20 else 120
+            
+            # Retry logic для сетевых ошибок
+            max_retries = 3
+            retry_delay = 1
+            success = False
+            
+            for attempt in range(max_retries):
+                # Recreate FormData for each retry attempt (FormData can only be processed once)
+                data = aiohttp.FormData()
+                data.add_field("chat_id", str(chat_id))
+                
+                if attach_message:
+                    data.add_field("caption", message)
+                    if parse_mode:
+                        data.add_field("parse_mode", parse_mode)
+                
+                if video.duration:
+                    data.add_field("duration", str(video.duration))
+                if video.width:
+                    data.add_field("width", str(video.width))
+                if video.height:
+                    data.add_field("height", str(video.height))
+                
+                if inline_keyboard:
+                    try:
+                        keyboard_dict = {
+                            "inline_keyboard": [
+                                [button.to_dict() for button in row] for row in inline_keyboard
+                            ]
+                        }
+                        keyboard_json = json.dumps(keyboard_dict, separators=(',', ':'), ensure_ascii=False)
+                        data.add_field("reply_markup", keyboard_json)
+                    except (TypeError, ValueError) as e:
+                        logger.error(f"Failed to serialize inline keyboard: {e}")
+
+                data.add_field("video", video.content, filename=video.filename or "video.mp4", content_type=video.content_type or "video/mp4")
+                
+                if video.thumbnail:
+                    data.add_field("thumbnail", video.thumbnail.content, filename=video.thumbnail.filename or "thumbnail.jpg", content_type=video.thumbnail.content_type or "image/jpeg")
+                
+                try:
+                    async with self._async_session.post(
+                        f"{self.base_url}/sendVideo",
+                        data=data,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                    ) as response:
+                        if response.ok:
+                            success = True
+                            break
+                        
+                        try:
+                            details = await response.json()
+                            error_text = details.get("description", await response.text())
+                        except Exception:
+                            error_text = await response.text()
+                        
+                        # Для ошибок типа "chat not found" не делаем retry
+                        if "chat not found" in error_text.lower() or "chat_id" in error_text.lower():
+                            logger.warning("Failed to send video to %s: %s (no retry)", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
+                        
+                        # Для других ошибок API тоже не делаем retry
+                        logger.error("Failed to send video to %s: %s", chat_id, error_text)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                        return failures
+                except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
+                        logger.warning(
+                            "Connection error sending video to %s (attempt %d/%d): %s. Retrying in %d seconds...",
+                            chat_id, attempt + 1, max_retries, e, wait_time
+                        )
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error("Connection error sending video to %s after %d attempts: %s", chat_id, max_retries, e)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                        return failures
+                except Exception as e:
+                    logger.error("Unexpected error sending video to %s: %s", chat_id, e, exc_info=True)
+                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Unexpected error: {e}"))
+                    return failures
+            
+            if not success:
+                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error="Failed after all retries"))
+            
+            return failures
+
+        # Для нескольких видео используем sendMediaGroup
+        total_size_mb = sum(len(video.content) for video in videos) / (1024 * 1024)
+        timeout = 300 if total_size_mb > 50 else 180 if total_size_mb > 20 else 120
+        
+        # Retry logic для сетевых ошибок
+        max_retries = 3
+        retry_delay = 0.5  # Уменьшено с 1 до 0.5 для более быстрой обработки
+        success = False
+        
+        for attempt in range(max_retries):
+            # Recreate FormData for each retry attempt (FormData can only be processed once)
+            media_array = []
+            data = aiohttp.FormData()
+            data.add_field("chat_id", str(chat_id))
+            
+            for idx, video in enumerate(videos):
+                file_id = f"video_{idx}"
+                media_item = {
+                    "type": "video",
+                    "media": f"attach://{file_id}",
+                }
+                
+                if attach_message and idx == 0:
+                    media_item["caption"] = message
+                    if parse_mode:
+                        media_item["parse_mode"] = parse_mode
+                
+                if video.duration:
+                    media_item["duration"] = video.duration
+                if video.width:
+                    media_item["width"] = video.width
+                if video.height:
+                    media_item["height"] = video.height
+                
+                media_array.append(media_item)
+                data.add_field(file_id, video.content, filename=video.filename or f"video_{idx}.mp4", content_type=video.content_type or "video/mp4")
+                
+                if video.thumbnail:
+                    thumb_id = f"thumb_{idx}"
+                    data.add_field(thumb_id, video.thumbnail.content, filename=video.thumbnail.filename or f"thumb_{idx}.jpg", content_type=video.thumbnail.content_type or "image/jpeg")
+                    media_item["thumbnail"] = f"attach://{thumb_id}"
+            
+            data.add_field("media", json.dumps(media_array, separators=(',', ':'), ensure_ascii=False))
+            
+            try:
+                async with self._async_session.post(
+                    f"{self.base_url}/sendMediaGroup",
+                    data=data,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    if not response.ok:
+                        try:
+                            details = await response.json()
+                            error_text = details.get("description", await response.text())
+                        except Exception:
+                            error_text = await response.text()
+                        
+                        # Для ошибок типа "chat not found" не делаем retry
+                        if "chat not found" in error_text.lower() or "chat_id" in error_text.lower():
+                            logger.warning("Failed to send media group to %s: %s (no retry)", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
+                        
+                        # Для других ошибок API тоже не делаем retry
+                        logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                        return failures
+                    
+                    success = True
+                    # Обработка inline keyboard
+                    if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(videos) > 1)):
+                        try:
+                            response_data = await response.json()
+                            if response_data.get("ok") and response_data.get("result"):
+                                messages = response_data["result"]
+                                if messages and len(messages) > 0:
+                                    last_message_id = messages[-1].get("message_id")
+                                    keyboard_dict = {
+                                        "inline_keyboard": [
+                                            [button.to_dict() for button in row] for row in inline_keyboard
+                                        ]
+                                    }
+                                    edit_data = {
+                                        "chat_id": chat_id,
+                                        "message_id": last_message_id,
+                                        "reply_markup": keyboard_dict,
+                                    }
+                                    async with self._async_session.post(
+                                        f"{self.base_url}/editMessageReplyMarkup",
+                                        json=edit_data,
+                                        timeout=aiohttp.ClientTimeout(total=15),
+                                    ) as edit_response:
+                                        if not edit_response.ok:
+                                            logger.warning("Failed to add inline keyboard to last message in media group")
+                        except Exception as e:
+                            logger.error(f"Error adding inline keyboard to media group: {e}")
+                    break  # Успешно отправили, выходим из цикла retry
+            except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)
+                    logger.warning(
+                        "Connection error sending media group to %s (attempt %d/%d): %s. Retrying in %d seconds...",
+                        chat_id, attempt + 1, max_retries, e, wait_time
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error("Connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, e)
+                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                    return failures
+            except Exception as e:
+                logger.error("Unexpected error sending media group to %s: %s", chat_id, e, exc_info=True)
+                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Unexpected error: {e}"))
+                return failures
+        
+        if not success:
+            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error="Failed after all retries"))
+        
         return failures
 

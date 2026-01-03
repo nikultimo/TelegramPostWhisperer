@@ -39,6 +39,8 @@ from .telegram_sender import (
     TelegramVideo,
     TelegramSender,
     load_chat_ids_from_csv,
+    save_blocked_users,
+    load_blocked_users,
 )
 
 logger = logging.getLogger(__name__)
@@ -215,6 +217,9 @@ async def generate_preview(payload: PreviewPayload) -> dict:
 async def enhance_message(payload: EnhancePayload) -> dict:
     """
     Enhance message text using AI, preserving Telegram Markdown formatting.
+    Also summarizes text if it exceeds Telegram limits:
+    - Media caption limit: 1,024 characters (can be extended to 4,096 with sendMessage)
+    - Regular message limit: 4,096 characters
     """
     logger.info(f"Enhance request received: parse_mode={payload.parse_mode}, message_length={len(payload.message) if payload.message else 0}")
     
@@ -304,7 +309,48 @@ async def enhance_message(payload: EnhancePayload) -> dict:
 - не используй ** для жирного текста, используй *
 """
 
-        system_prompt = f"""Ты эксперт по написанию привлекательных сообщений для Telegram.
+        # Определяем лимиты Telegram
+        # Media caption: 1,024 символа (можно до 4,096 с sendMessage)
+        # Regular message: 4,096 символов
+        message_length = len(payload.message)
+        MEDIA_CAPTION_LIMIT = 1024
+        MESSAGE_LIMIT = 4096
+        
+        # Определяем, нужно ли сокращать текст
+        needs_summarization = message_length > MESSAGE_LIMIT
+        needs_caption_summarization = message_length > MEDIA_CAPTION_LIMIT
+        
+        if needs_summarization or needs_caption_summarization:
+            # Определяем целевой лимит
+            if needs_summarization:
+                target_limit = MESSAGE_LIMIT
+                limit_type = "обычного сообщения (4,096 символов)"
+            else:
+                target_limit = MEDIA_CAPTION_LIMIT
+                limit_type = "подписи к медиа (1,024 символа, можно расширить до 4,096 с sendMessage)"
+            
+            logger.info(f"Text exceeds Telegram limit ({message_length} > {target_limit}). Will summarize to fit {limit_type}")
+            
+            system_prompt = f"""Ты эксперт по написанию и суммаризации сообщений для Telegram.
+Твоя задача - сократить и улучшить текст сообщения, сохранив все ключевые моменты и форматирование.
+
+{format_instructions}
+
+Важно:
+- Сократи текст до {target_limit} символов или меньше
+- Сохрани все важные ссылки и их форматирование
+- Сохрани ключевую информацию и смысл сообщения
+- Используй форматирование для выделения важных моментов (жирный, курсив, подчеркивание)
+- Делай текст более компактным, но читаемым
+- Если в тексте уже есть форматирование, сохрани его
+- Поддерживай вложенные entities (например, жирный текст внутри ссылки)
+- Убедись, что все теги правильно закрыты и валидны для Telegram API
+- Не используй ** для жирного текста, используй *
+- Результат должен быть не более {target_limit} символов"""
+            
+            user_prompt = f"Сократи и улучши следующий текст сообщения, сохранив все ключевые моменты и форматирование. Текст должен быть не более {target_limit} символов:\n\n{payload.message}"
+        else:
+            system_prompt = f"""Ты эксперт по написанию привлекательных сообщений для Telegram.
 Твоя задача - улучшить текст сообщения, сделав его более интересным, структурированным и привлекательным для читателя.
 
 {format_instructions}
@@ -319,13 +365,15 @@ async def enhance_message(payload: EnhancePayload) -> dict:
 - Поддерживай вложенные entities (например, жирный текст внутри ссылки)
 - Убедись, что все теги правильно закрыты и валидны для Telegram API
 - Не используй ** для жирного текста, используй *, да и в целом не используй ** для форматирования, используй *"""
+            
+            user_prompt = f"Улучши следующий текст сообщения:\n\n{payload.message}"
 
         def create_completion():
             return client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Улучши следующий текст сообщения:\n\n{payload.message}"}
+                    {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.7,
                 max_tokens=2000,
@@ -349,9 +397,48 @@ async def enhance_message(payload: EnhancePayload) -> dict:
                 detail="OpenAI API returned empty enhanced text"
             )
         
-        logger.info(f"Enhanced message length: {len(enhanced_text)}")
+        # Проверяем, что результат не превышает лимиты
+        final_length = len(enhanced_text)
+        if needs_summarization and final_length > MESSAGE_LIMIT:
+            logger.warning(f"Enhanced text still exceeds message limit ({final_length} > {MESSAGE_LIMIT}), truncating...")
+            # Обрезаем до лимита, стараясь не обрезать посередине форматирования
+            enhanced_text = enhanced_text[:MESSAGE_LIMIT]
+            # Пытаемся найти последний закрывающий тег или символ форматирования
+            if payload.parse_mode == "HTML":
+                # Ищем последний закрывающий тег
+                last_tag_end = enhanced_text.rfind(">")
+                if last_tag_end > MESSAGE_LIMIT - 100:  # Если тег близко к концу
+                    enhanced_text = enhanced_text[:last_tag_end + 1]
+            elif payload.parse_mode in ["Markdown", "MarkdownV2"]:
+                # Ищем последний закрывающий символ форматирования
+                for char in ["*", "_", "`", "]"]:
+                    last_pos = enhanced_text.rfind(char)
+                    if last_pos > MESSAGE_LIMIT - 50:
+                        enhanced_text = enhanced_text[:last_pos + 1]
+                        break
+        elif needs_caption_summarization and final_length > MEDIA_CAPTION_LIMIT:
+            logger.warning(f"Enhanced text still exceeds media caption limit ({final_length} > {MEDIA_CAPTION_LIMIT}), truncating...")
+            # Аналогичная логика для caption
+            enhanced_text = enhanced_text[:MEDIA_CAPTION_LIMIT]
+            if payload.parse_mode == "HTML":
+                last_tag_end = enhanced_text.rfind(">")
+                if last_tag_end > MEDIA_CAPTION_LIMIT - 100:
+                    enhanced_text = enhanced_text[:last_tag_end + 1]
+            elif payload.parse_mode in ["Markdown", "MarkdownV2"]:
+                for char in ["*", "_", "`", "]"]:
+                    last_pos = enhanced_text.rfind(char)
+                    if last_pos > MEDIA_CAPTION_LIMIT - 50:
+                        enhanced_text = enhanced_text[:last_pos + 1]
+                        break
         
-        return {"enhanced_message": enhanced_text}
+        logger.info(f"Enhanced message length: {len(enhanced_text)} (original: {message_length})")
+        
+        return {
+            "enhanced_message": enhanced_text,
+            "original_length": message_length,
+            "enhanced_length": len(enhanced_text),
+            "was_summarized": needs_summarization or needs_caption_summarization
+        }
     
     except HTTPException:
         raise
@@ -451,8 +538,10 @@ async def send_broadcast(
     if not csv_bytes:
         raise HTTPException(status_code=400, detail="CSV file is empty")
 
+    # Note: We'll filter blocked users per bot token later, after we know which bots are being used
+    # For now, load all chat IDs without filtering (filtering will happen per bot)
     try:
-        chat_ids = load_chat_ids_from_csv(csv_bytes)
+        chat_ids = load_chat_ids_from_csv(csv_bytes, filter_blocked=False)
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=400, detail=f"Failed to read CSV: {exc}") from exc
 
@@ -532,6 +621,13 @@ async def send_broadcast(
     total_count = 0
     
     for bot_token in tokens_to_use:
+        # Filter out blocked users for this specific bot token
+        blocked_users_for_bot = load_blocked_users(bot_token) if bot_token else set()
+        filtered_chat_ids = [cid for cid in chat_ids if cid not in blocked_users_for_bot]
+        
+        if blocked_users_for_bot:
+            logger.info(f"Filtered out {len(blocked_users_for_bot)} blocked user(s) for bot token {bot_token[:20]}...")
+        
         config = TelegramBroadcastConfig(
             token=bot_token,
             message=message,
@@ -546,11 +642,27 @@ async def send_broadcast(
         )
 
         sender = TelegramSender(token=bot_token)
-        summary = await run_in_threadpool(sender.broadcast, chat_ids, config)
+        # Используем асинхронную версию для параллельной отправки
+        summary = await sender.broadcast_async(filtered_chat_ids, config)
         
         total_count += summary.total
         total_delivered += summary.delivered
         total_failed.extend(summary.failed)
+        
+        # Extract blocked users for this specific bot (users with "chat not found" errors)
+        # These are users who have blocked this bot or deleted their account
+        blocked_user_ids_for_bot = set()
+        for report in summary.failed:
+            if report.error and "chat not found" in report.error.lower():
+                blocked_user_ids_for_bot.add(str(report.chat_id))
+        
+        # Save blocked users to file for this specific bot token
+        if blocked_user_ids_for_bot:
+            try:
+                save_blocked_users(bot_token, blocked_user_ids_for_bot)
+                logger.info(f"Saved {len(blocked_user_ids_for_bot)} blocked user(s) for bot token {bot_token[:20]}...")
+            except Exception as e:
+                logger.error(f"Failed to save blocked users for bot token: {e}", exc_info=True)
         
         all_results.append({
             "token": bot_token[:20] + "..." if len(bot_token) > 20 else bot_token,
@@ -558,6 +670,7 @@ async def send_broadcast(
             "delivered": summary.delivered,
             "failed_count": len(summary.failed),
             "success": summary.success,
+            "blocked_users_saved": len(blocked_user_ids_for_bot),
         })
 
     response = {

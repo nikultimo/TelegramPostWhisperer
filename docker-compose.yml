@@ -15,7 +15,7 @@ services:
     volumes:
       - /home/nikultimo/Documents/startups/telegrammessagesender/frontend:/app/frontend:ro
       - /home/nikultimo/Documents/startups/telegrammessagesender/bots.yaml:/app/bots.yaml:ro
-      - /home/nikultimo/Documents/startups/telegrammessagesender/data:/app/data:ro
+      - /home/nikultimo/Documents/startups/telegrammessagesender/data:/app/data:rw
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
