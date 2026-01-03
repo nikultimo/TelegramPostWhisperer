@@ -140,12 +140,13 @@ def load_chat_ids_from_csv(
             if blocked_users:
                 logger.info(f"Filtering out {len(blocked_users)} blocked user(s) for bot token")
 
-    ids: List[str] = []
+    ids_set: set[str] = set()  # Use set to automatically remove duplicates
     column_idx = (
         header.index(column_name) if header and column_name in header else 0
     )
 
     filtered_count = 0
+    duplicate_count = 0
     for row in data_rows:
         if not row:
             continue
@@ -167,12 +168,21 @@ def load_chat_ids_from_csv(
             filtered_count += 1
             continue
         
-        ids.append(normalized)
+        # Check for duplicates
+        if normalized in ids_set:
+            duplicate_count += 1
+            continue
+        
+        ids_set.add(normalized)
 
     if filter_blocked and filtered_count > 0:
         logger.info(f"Filtered out {filtered_count} blocked user(s) from CSV")
+    
+    if duplicate_count > 0:
+        logger.info(f"Removed {duplicate_count} duplicate user(s) from CSV")
 
-    return ids
+    # Convert set to list to preserve order (Python 3.7+ maintains insertion order for sets)
+    return list(ids_set)
 
 
 def _looks_like_header(header: Sequence[str], column_name: str) -> bool:
@@ -267,6 +277,56 @@ def load_blocked_users(token: str) -> set[str]:
     except Exception as e:
         logger.error(f"Failed to load blocked users from {blocked_file}: {e}")
         return set()
+
+
+def is_blocked_user_error(error_text: Optional[str]) -> bool:
+    """
+    Determine if an error message indicates that a user is blocked or deactivated.
+    
+    Args:
+        error_text: Error message from Telegram API
+    
+    Returns:
+        True if the error indicates a blocked/deactivated user, False otherwise
+    """
+    if not error_text:
+        return False
+    
+    error_lower = error_text.lower()
+    
+    # Connection errors should not be considered as blocked users (these are temporary)
+    connection_patterns = [
+        "connection error",
+        "timeout",
+        "cannot connect",
+        "ssl:default",
+        "network",
+        "retrying",
+        "attempt",
+    ]
+    
+    # Check if it's a connection error first (these are temporary, not permanent blocks)
+    for pattern in connection_patterns:
+        if pattern in error_lower:
+            return False
+    
+    # Check for various blocked/deactivated user error patterns
+    # These indicate permanent issues that should be saved to avoid retrying
+    blocked_patterns = [
+        "user_is_blocked",
+        "user is blocked",
+        "user is deactivated",
+        "chat not found",
+        "forbidden: user is deactivated",
+        "forbidden: user_is_blocked",
+    ]
+    
+    # Check if it matches any blocked user pattern
+    for pattern in blocked_patterns:
+        if pattern in error_lower:
+            return True
+    
+    return False
 
 
 def save_blocked_users(token: str, blocked_ids: set[str]) -> None:
@@ -505,9 +565,9 @@ class TelegramSender:
         photos = list(config.photos or [])
         videos = list(config.videos or [])
         
-        # Для малых батчей (<= 20 пользователей) не применяем строгий rate limiting
+        # Для малых батчей (<= 50 пользователей) не применяем строгий rate limiting
         # Telegram API позволяет небольшие всплески запросов
-        use_rate_limiting = len(chat_ids) > 20
+        use_rate_limiting = len(chat_ids) > 50
         
         # Семафор для ограничения количества одновременных запросов
         semaphore = asyncio.Semaphore(max_concurrent)
@@ -519,10 +579,12 @@ class TelegramSender:
             # Улучшенный rate limiter с использованием очереди токенов
             # Это позволяет избежать блокировки всех запросов одним lock
             min_interval = 1.0 / rate_limit_per_second
-            token_queue = asyncio.Queue(maxsize=int(rate_limit_per_second * 2))
+            # Увеличиваем размер очереди для лучшей пропускной способности
+            queue_size = int(rate_limit_per_second * 3)
+            token_queue = asyncio.Queue(maxsize=queue_size)
             
             # Заполняем очередь токенами
-            for _ in range(int(rate_limit_per_second * 2)):
+            for _ in range(queue_size):
                 token_queue.put_nowait(None)
             
             # Фоновая задача для пополнения токенов
@@ -627,12 +689,13 @@ class TelegramSender:
         
         # Создаем сессию aiohttp с оптимизированными настройками
         connector = aiohttp.TCPConnector(
-            limit=max_concurrent * 2,  # Увеличиваем лимит соединений
-            limit_per_host=max_concurrent,
-            ttl_dns_cache=300,
+            limit=max_concurrent * 3,  # Увеличиваем лимит соединений для лучшей параллельности
+            limit_per_host=max_concurrent * 2,  # Увеличиваем лимит на хост
+            ttl_dns_cache=600,  # Увеличиваем кеш DNS
             force_close=False,  # Переиспользуем соединения
+            enable_cleanup_closed=True,  # Автоматическая очистка закрытых соединений
         )
-        timeout = aiohttp.ClientTimeout(total=300, connect=30)  # Увеличиваем таймауты для больших файлов
+        timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=60)  # Увеличиваем таймауты для больших файлов
         try:
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 self._async_session = session
@@ -1496,7 +1559,50 @@ class TelegramSender:
                         logger.warning("Failed to send message to %s: %s (no retry)", chat_id, error_text)
                         return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
                     
-                    # Для других ошибок API тоже не делаем retry
+                    # Если ошибка связана с парсингом entities, пробуем отправить без parse_mode
+                    if "can't parse" in error_text.lower() and "entities" in error_text.lower() and config.parse_mode:
+                        logger.warning("Entity parsing error detected, retrying without parse_mode for chat_id %s", chat_id)
+                        # Retry without parse_mode
+                        retry_payload = {
+                            "chat_id": chat_id,
+                            "text": config.message,
+                            "disable_web_page_preview": config.disable_web_page_preview,
+                        }
+                        # Не добавляем parse_mode
+                        
+                        if config.inline_keyboard:
+                            retry_payload["reply_markup"] = {
+                                "inline_keyboard": [
+                                    [button.to_dict() for button in row] for row in config.inline_keyboard
+                                ]
+                            }
+                        
+                        if config.extra_api_params:
+                            retry_payload.update(config.extra_api_params)
+                        
+                        try:
+                            async with self._async_session.post(
+                                f"{self.base_url}/sendMessage",
+                                json=retry_payload,
+                                timeout=aiohttp.ClientTimeout(total=15),
+                            ) as retry_response:
+                                if retry_response.ok:
+                                    logger.info("Successfully sent message without parse_mode for chat_id %s", chat_id)
+                                    return DeliveryReport(chat_id=chat_id, ok=True)
+                                else:
+                                    # Если и без parse_mode не получилось, возвращаем исходную ошибку
+                                    try:
+                                        retry_details = await retry_response.json()
+                                        retry_error_text = retry_details.get("description", await retry_response.text())
+                                    except Exception:
+                                        retry_error_text = await retry_response.text()
+                                    logger.error("Failed to send message even without parse_mode to %s: %s", chat_id, retry_error_text)
+                                    return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                        except Exception as retry_e:
+                            logger.error("Error during parse_mode retry for message to %s: %s", chat_id, retry_e)
+                            return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
+                    
+                    # Для других ошибок API не делаем retry
                     logger.error("Failed to send message to %s: %s", chat_id, error_text)
                     return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
             except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
@@ -1592,10 +1698,59 @@ class TelegramSender:
                             failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
                             return failures
                         
-                        # Для других ошибок API тоже не делаем retry
-                        logger.error("Failed to send photo to %s: %s", chat_id, error_text)
-                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
-                        return failures
+                        # Если ошибка связана с парсингом entities, пробуем отправить без parse_mode
+                        if "can't parse" in error_text.lower() and "entities" in error_text.lower() and parse_mode:
+                            logger.warning("Entity parsing error detected, retrying without parse_mode for chat_id %s", chat_id)
+                            # Retry without parse_mode
+                            retry_data = aiohttp.FormData()
+                            retry_data.add_field("chat_id", str(chat_id))
+                            
+                            if attach_message:
+                                retry_data.add_field("caption", message)
+                                # Не добавляем parse_mode
+                            
+                            if inline_keyboard:
+                                try:
+                                    keyboard_dict = {
+                                        "inline_keyboard": [
+                                            [button.to_dict() for button in row] for row in inline_keyboard
+                                        ]
+                                    }
+                                    keyboard_json = json.dumps(keyboard_dict, separators=(',', ':'), ensure_ascii=False)
+                                    retry_data.add_field("reply_markup", keyboard_json)
+                                except (TypeError, ValueError) as e:
+                                    logger.error(f"Failed to serialize inline keyboard: {e}")
+                            
+                            retry_data.add_field("photo", photo.content, filename=photo.filename or "photo.jpg", content_type=photo.content_type or "image/jpeg")
+                            
+                            try:
+                                async with self._async_session.post(
+                                    f"{self.base_url}/sendPhoto",
+                                    data=retry_data,
+                                    timeout=aiohttp.ClientTimeout(total=timeout),
+                                ) as retry_response:
+                                    if retry_response.ok:
+                                        logger.info("Successfully sent photo without parse_mode for chat_id %s", chat_id)
+                                        return failures  # Success
+                                    else:
+                                        # Если и без parse_mode не получилось, возвращаем исходную ошибку
+                                        try:
+                                            retry_details = await retry_response.json()
+                                            retry_error_text = retry_details.get("description", await retry_response.text())
+                                        except Exception:
+                                            retry_error_text = await retry_response.text()
+                                        logger.error("Failed to send photo even without parse_mode to %s: %s", chat_id, retry_error_text)
+                                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                        return failures
+                            except Exception as retry_e:
+                                logger.error("Error during parse_mode retry for photo to %s: %s", chat_id, retry_e)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        else:
+                            # Для других ошибок API не делаем retry
+                            logger.error("Failed to send photo to %s: %s", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
                 except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
                     if attempt < max_retries - 1:
                         wait_time = retry_delay * (2 ** attempt)
@@ -1669,10 +1824,85 @@ class TelegramSender:
                             failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
                             return failures
                         
-                        # Для других ошибок API тоже не делаем retry
-                        logger.error("Failed to send media group to %s: %s", chat_id, error_text)
-                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
-                        return failures
+                        # Если ошибка связана с парсингом entities, пробуем отправить без parse_mode
+                        if "can't parse" in error_text.lower() and "entities" in error_text.lower() and parse_mode:
+                            logger.warning("Entity parsing error detected, retrying without parse_mode for chat_id %s", chat_id)
+                            # Retry without parse_mode
+                            retry_media_array = []
+                            retry_data = aiohttp.FormData()
+                            retry_data.add_field("chat_id", str(chat_id))
+                            
+                            for idx, photo in enumerate(photos):
+                                file_id = f"photo_{idx}"
+                                media_item = {
+                                    "type": "photo",
+                                    "media": f"attach://{file_id}",
+                                }
+                                
+                                if attach_message and idx == 0:
+                                    media_item["caption"] = message
+                                    # Не добавляем parse_mode
+                                
+                                retry_media_array.append(media_item)
+                                retry_data.add_field(file_id, photo.content, filename=photo.filename or f"photo_{idx}.jpg", content_type=photo.content_type or "image/jpeg")
+                            
+                            retry_data.add_field("media", json.dumps(retry_media_array, separators=(',', ':'), ensure_ascii=False))
+                            
+                            try:
+                                async with self._async_session.post(
+                                    f"{self.base_url}/sendMediaGroup",
+                                    data=retry_data,
+                                    timeout=aiohttp.ClientTimeout(total=timeout),
+                                ) as retry_response:
+                                    if retry_response.ok:
+                                        logger.info("Successfully sent media group without parse_mode for chat_id %s", chat_id)
+                                        # Обработка inline keyboard
+                                        if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(photos) > 1)):
+                                            try:
+                                                retry_response_data = await retry_response.json()
+                                                if retry_response_data.get("ok") and retry_response_data.get("result"):
+                                                    messages = retry_response_data["result"]
+                                                    if messages and len(messages) > 0:
+                                                        last_message_id = messages[-1].get("message_id")
+                                                        keyboard_dict = {
+                                                            "inline_keyboard": [
+                                                                [button.to_dict() for button in row] for row in inline_keyboard
+                                                            ]
+                                                        }
+                                                        edit_data = {
+                                                            "chat_id": chat_id,
+                                                            "message_id": last_message_id,
+                                                            "reply_markup": keyboard_dict,
+                                                        }
+                                                        async with self._async_session.post(
+                                                            f"{self.base_url}/editMessageReplyMarkup",
+                                                            json=edit_data,
+                                                            timeout=aiohttp.ClientTimeout(total=15),
+                                                        ) as edit_response:
+                                                            if not edit_response.ok:
+                                                                logger.warning("Failed to add inline keyboard to last message in media group")
+                                            except Exception as e:
+                                                logger.error(f"Error adding inline keyboard to media group: {e}")
+                                        return failures  # Success
+                                    else:
+                                        # Если и без parse_mode не получилось, возвращаем исходную ошибку
+                                        try:
+                                            retry_details = await retry_response.json()
+                                            retry_error_text = retry_details.get("description", await retry_response.text())
+                                        except Exception:
+                                            retry_error_text = await retry_response.text()
+                                        logger.error("Failed to send media group even without parse_mode to %s: %s", chat_id, retry_error_text)
+                                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                        return failures
+                            except Exception as retry_e:
+                                logger.error("Error during parse_mode retry for media group to %s: %s", chat_id, retry_e)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        else:
+                            # Для других ошибок API не делаем retry
+                            logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
                     
                     success = True
                     # Обработка inline keyboard
@@ -1810,10 +2040,69 @@ class TelegramSender:
                             failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
                             return failures
                         
-                        # Для других ошибок API тоже не делаем retry
-                        logger.error("Failed to send video to %s: %s", chat_id, error_text)
-                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
-                        return failures
+                        # Если ошибка связана с парсингом entities, пробуем отправить без parse_mode
+                        if "can't parse" in error_text.lower() and "entities" in error_text.lower() and parse_mode:
+                            logger.warning("Entity parsing error detected, retrying without parse_mode for chat_id %s", chat_id)
+                            # Retry without parse_mode
+                            retry_data = aiohttp.FormData()
+                            retry_data.add_field("chat_id", str(chat_id))
+                            
+                            if attach_message:
+                                retry_data.add_field("caption", message)
+                                # Не добавляем parse_mode
+                            
+                            if video.duration:
+                                retry_data.add_field("duration", str(video.duration))
+                            if video.width:
+                                retry_data.add_field("width", str(video.width))
+                            if video.height:
+                                retry_data.add_field("height", str(video.height))
+                            
+                            if inline_keyboard:
+                                try:
+                                    keyboard_dict = {
+                                        "inline_keyboard": [
+                                            [button.to_dict() for button in row] for row in inline_keyboard
+                                        ]
+                                    }
+                                    keyboard_json = json.dumps(keyboard_dict, separators=(',', ':'), ensure_ascii=False)
+                                    retry_data.add_field("reply_markup", keyboard_json)
+                                except (TypeError, ValueError) as e:
+                                    logger.error(f"Failed to serialize inline keyboard: {e}")
+                            
+                            retry_data.add_field("video", video.content, filename=video.filename or "video.mp4", content_type=video.content_type or "video/mp4")
+                            
+                            if video.thumbnail:
+                                retry_data.add_field("thumbnail", video.thumbnail.content, filename=video.thumbnail.filename or "thumbnail.jpg", content_type=video.thumbnail.content_type or "image/jpeg")
+                            
+                            try:
+                                async with self._async_session.post(
+                                    f"{self.base_url}/sendVideo",
+                                    data=retry_data,
+                                    timeout=aiohttp.ClientTimeout(total=timeout),
+                                ) as retry_response:
+                                    if retry_response.ok:
+                                        logger.info("Successfully sent video without parse_mode for chat_id %s", chat_id)
+                                        return failures  # Success
+                                    else:
+                                        # Если и без parse_mode не получилось, возвращаем исходную ошибку
+                                        try:
+                                            retry_details = await retry_response.json()
+                                            retry_error_text = retry_details.get("description", await retry_response.text())
+                                        except Exception:
+                                            retry_error_text = await retry_response.text()
+                                        logger.error("Failed to send video even without parse_mode to %s: %s", chat_id, retry_error_text)
+                                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                        return failures
+                            except Exception as retry_e:
+                                logger.error("Error during parse_mode retry for video to %s: %s", chat_id, retry_e)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        else:
+                            # Для других ошибок API не делаем retry
+                            logger.error("Failed to send video to %s: %s", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
                 except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
                     if attempt < max_retries - 1:
                         wait_time = retry_delay * (2 ** attempt)
@@ -1899,10 +2188,97 @@ class TelegramSender:
                             failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
                             return failures
                         
-                        # Для других ошибок API тоже не делаем retry
-                        logger.error("Failed to send media group to %s: %s", chat_id, error_text)
-                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
-                        return failures
+                        # Если ошибка связана с парсингом entities, пробуем отправить без parse_mode
+                        if "can't parse" in error_text.lower() and "entities" in error_text.lower() and parse_mode:
+                            logger.warning("Entity parsing error detected, retrying without parse_mode for chat_id %s", chat_id)
+                            # Retry without parse_mode
+                            retry_media_array = []
+                            retry_data = aiohttp.FormData()
+                            retry_data.add_field("chat_id", str(chat_id))
+                            
+                            for idx, video in enumerate(videos):
+                                file_id = f"video_{idx}"
+                                media_item = {
+                                    "type": "video",
+                                    "media": f"attach://{file_id}",
+                                }
+                                
+                                if attach_message and idx == 0:
+                                    media_item["caption"] = message
+                                    # Не добавляем parse_mode
+                                
+                                if video.duration:
+                                    media_item["duration"] = video.duration
+                                if video.width:
+                                    media_item["width"] = video.width
+                                if video.height:
+                                    media_item["height"] = video.height
+                                
+                                retry_media_array.append(media_item)
+                                retry_data.add_field(file_id, video.content, filename=video.filename or f"video_{idx}.mp4", content_type=video.content_type or "video/mp4")
+                                
+                                if video.thumbnail:
+                                    thumb_id = f"thumb_{idx}"
+                                    retry_data.add_field(thumb_id, video.thumbnail.content, filename=video.thumbnail.filename or f"thumb_{idx}.jpg", content_type=video.thumbnail.content_type or "image/jpeg")
+                                    media_item["thumbnail"] = f"attach://{thumb_id}"
+                            
+                            retry_data.add_field("media", json.dumps(retry_media_array, separators=(',', ':'), ensure_ascii=False))
+                            
+                            try:
+                                async with self._async_session.post(
+                                    f"{self.base_url}/sendMediaGroup",
+                                    data=retry_data,
+                                    timeout=aiohttp.ClientTimeout(total=timeout),
+                                ) as retry_response:
+                                    if retry_response.ok:
+                                        logger.info("Successfully sent media group without parse_mode for chat_id %s", chat_id)
+                                        # Обработка inline keyboard
+                                        if inline_keyboard and (attach_keyboard_to_last or (attach_message and len(videos) > 1)):
+                                            try:
+                                                retry_response_data = await retry_response.json()
+                                                if retry_response_data.get("ok") and retry_response_data.get("result"):
+                                                    messages = retry_response_data["result"]
+                                                    if messages and len(messages) > 0:
+                                                        last_message_id = messages[-1].get("message_id")
+                                                        keyboard_dict = {
+                                                            "inline_keyboard": [
+                                                                [button.to_dict() for button in row] for row in inline_keyboard
+                                                            ]
+                                                        }
+                                                        edit_data = {
+                                                            "chat_id": chat_id,
+                                                            "message_id": last_message_id,
+                                                            "reply_markup": keyboard_dict,
+                                                        }
+                                                        async with self._async_session.post(
+                                                            f"{self.base_url}/editMessageReplyMarkup",
+                                                            json=edit_data,
+                                                            timeout=aiohttp.ClientTimeout(total=15),
+                                                        ) as edit_response:
+                                                            if not edit_response.ok:
+                                                                logger.warning("Failed to add inline keyboard to last message in media group")
+                                            except Exception as e:
+                                                logger.error(f"Error adding inline keyboard to media group: {e}")
+                                        return failures  # Success
+                                    else:
+                                        # Если и без parse_mode не получилось, возвращаем исходную ошибку
+                                        try:
+                                            retry_details = await retry_response.json()
+                                            retry_error_text = retry_details.get("description", await retry_response.text())
+                                        except Exception:
+                                            retry_error_text = await retry_response.text()
+                                        logger.error("Failed to send media group even without parse_mode to %s: %s", chat_id, retry_error_text)
+                                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                        return failures
+                            except Exception as retry_e:
+                                logger.error("Error during parse_mode retry for media group to %s: %s", chat_id, retry_e)
+                                failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                                return failures
+                        else:
+                            # Для других ошибок API не делаем retry
+                            logger.error("Failed to send media group to %s: %s", chat_id, error_text)
+                            failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=error_text))
+                            return failures
                     
                     success = True
                     # Обработка inline keyboard

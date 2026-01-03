@@ -41,6 +41,7 @@ from .telegram_sender import (
     load_chat_ids_from_csv,
     save_blocked_users,
     load_blocked_users,
+    is_blocked_user_error,
 )
 from .settings import (
     OPENROUTER_API_KEY,
@@ -664,11 +665,11 @@ async def send_broadcast(
         total_delivered += summary.delivered
         total_failed.extend(summary.failed)
         
-        # Extract blocked users for this specific bot (users with "chat not found" errors)
-        # These are users who have blocked this bot or deleted their account
+        # Extract blocked users for this specific bot
+        # These are users who have blocked this bot, deactivated their account, or chat not found
         blocked_user_ids_for_bot = set()
         for report in summary.failed:
-            if report.error and "chat not found" in report.error.lower():
+            if report.error and is_blocked_user_error(report.error):
                 blocked_user_ids_for_bot.add(str(report.chat_id))
         
         # Save blocked users to file for this specific bot token
