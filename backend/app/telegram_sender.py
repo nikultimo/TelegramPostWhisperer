@@ -355,7 +355,22 @@ class TelegramSender:
         chat_ids: Iterable[Union[int, str]],
         config: TelegramBroadcastConfig,
     ) -> BroadcastSummary:
-        chat_ids = list(chat_ids)
+        # Дедупликация chat_ids для предотвращения повторной отправки одному пользователю
+        seen = set()
+        unique_chat_ids = []
+        duplicates_count = 0
+        for chat_id in chat_ids:
+            chat_id_str = str(chat_id)
+            if chat_id_str not in seen:
+                seen.add(chat_id_str)
+                unique_chat_ids.append(chat_id)
+            else:
+                duplicates_count += 1
+        
+        if duplicates_count > 0:
+            logger.warning(f"Found {duplicates_count} duplicate chat_id(s), removed to prevent duplicate messages")
+        
+        chat_ids = unique_chat_ids
         failed: List[DeliveryReport] = []
         delivered = 0
 
@@ -468,7 +483,22 @@ class TelegramSender:
             max_concurrent: Максимальное количество одновременных запросов (по умолчанию 50)
             rate_limit_per_second: Максимальное количество запросов в секунду (по умолчанию 30)
         """
-        chat_ids = list(chat_ids)
+        # Дедупликация chat_ids для предотвращения повторной отправки одному пользователю
+        seen = set()
+        unique_chat_ids = []
+        duplicates_count = 0
+        for chat_id in chat_ids:
+            chat_id_str = str(chat_id)
+            if chat_id_str not in seen:
+                seen.add(chat_id_str)
+                unique_chat_ids.append(chat_id)
+            else:
+                duplicates_count += 1
+        
+        if duplicates_count > 0:
+            logger.warning(f"Found {duplicates_count} duplicate chat_id(s), removed to prevent duplicate messages")
+        
+        chat_ids = unique_chat_ids
         if not chat_ids:
             return BroadcastSummary(total=0, delivered=0, failed=[])
 
