@@ -11,12 +11,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Iterable, List, Optional, Sequence, Tuple, Union
 
+import aiofiles
 import aiohttp
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+
+def _format_exception(e: Exception) -> str:
+    """
+    Format an exception for logging, handling empty messages gracefully.
+    Returns a descriptive string even if the exception message is empty.
+    """
+    error_msg = str(e).strip() if str(e).strip() else None
+    if error_msg:
+        return f"{type(e).__name__}: {error_msg}"
+    return f"{type(e).__name__} (no message)"
 
 
 @dataclass(slots=True)
@@ -366,6 +378,119 @@ def save_blocked_users(token: str, blocked_ids: set[str]) -> None:
             writer.writerow(["telegram_id"])  # Header
             for user_id in sorted(all_blocked, key=lambda x: (len(x), x)):
                 writer.writerow([user_id])
+        
+        logger.info(f"Saved {len(new_blocked)} new blocked user(s) to {blocked_file} (total: {len(all_blocked)})")
+    except OSError as e:
+        # Handle read-only filesystem gracefully
+        if e.errno == 30:  # Read-only file system
+            logger.warning(
+                f"Cannot save blocked users to {blocked_file}: filesystem is read-only. "
+                f"{len(new_blocked)} blocked user(s) detected but not persisted. "
+                f"Consider mounting /app/data as writable or using a writable volume."
+            )
+        else:
+            logger.error(f"Failed to save blocked users to {blocked_file}: {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Failed to save blocked users to {blocked_file}: {e}", exc_info=True)
+
+
+async def load_blocked_users_async(token: str) -> set[str]:
+    """
+    Async version: Load blocked user IDs from the blocked_users CSV file for a specific bot token.
+    
+    Args:
+        token: Bot token to load blocked users for
+    
+    Returns:
+        Set of blocked user IDs (as strings).
+    """
+    blocked_file = get_blocked_users_file_path(token)
+    
+    if not blocked_file.exists():
+        logger.debug(f"Blocked users file not found at {blocked_file}, returning empty set")
+        return set()
+    
+    try:
+        blocked_ids = set()
+        async with aiofiles.open(blocked_file, "r", encoding="utf-8") as f:
+            content = await f.read()
+            
+            # Parse CSV content
+            text_stream = io.StringIO(content)
+            reader = csv.reader(text_stream)
+            rows = list(reader)
+            
+            if not rows:
+                return set()
+            
+            # Check if first row is a header
+            header = [cell.strip() for cell in rows[0]]
+            data_rows = rows[1:] if _looks_like_header(header, "telegram_id") else rows
+            
+            column_idx = (
+                header.index("telegram_id") if header and "telegram_id" in header else 0
+            )
+            
+            for row in data_rows:
+                if not row:
+                    continue
+                try:
+                    raw_value = row[column_idx].strip()
+                    if raw_value:
+                        normalized = raw_value.replace(" ", "")
+                        blocked_ids.add(normalized)
+                except (IndexError, ValueError):
+                    continue
+        
+        logger.info(f"Loaded {len(blocked_ids)} blocked user(s) from {blocked_file}")
+        return blocked_ids
+    except Exception as e:
+        logger.error(f"Failed to load blocked users from {blocked_file}: {e}")
+        return set()
+
+
+async def save_blocked_users_async(token: str, blocked_ids: set[str]) -> None:
+    """
+    Async version: Save blocked user IDs to the blocked_users CSV file for a specific bot token.
+    Appends new blocked users to the existing file (if any).
+    
+    Args:
+        token: Bot token to save blocked users for
+        blocked_ids: Set of blocked user IDs to save
+    """
+    if not blocked_ids:
+        logger.debug("No blocked users to save")
+        return
+    
+    blocked_file = get_blocked_users_file_path(token)
+    
+    # Load existing blocked users to avoid duplicates
+    existing_blocked = await load_blocked_users_async(token)
+    
+    # Merge with new blocked users
+    all_blocked = existing_blocked | blocked_ids
+    
+    # Only save if there are new blocked users
+    new_blocked = blocked_ids - existing_blocked
+    if not new_blocked:
+        logger.debug("No new blocked users to save")
+        return
+    
+    try:
+        # Ensure directory exists
+        blocked_file.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write all blocked users (existing + new) using proper CSV format
+        # Use StringIO to build CSV content, then write asynchronously
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["telegram_id"])  # Header
+        for user_id in sorted(all_blocked, key=lambda x: (len(x), x)):
+            writer.writerow([user_id])
+        
+        csv_content = output.getvalue()
+        async with aiofiles.open(blocked_file, "w", encoding="utf-8", newline="") as f:
+            await f.write(csv_content)
         
         logger.info(f"Saved {len(new_blocked)} new blocked user(s) to {blocked_file} (total: {len(all_blocked)})")
     except OSError as e:
@@ -1608,14 +1733,16 @@ class TelegramSender:
             except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
                 if attempt < max_retries - 1:
                     wait_time = retry_delay * (2 ** attempt)
+                    error_msg = _format_exception(e)
                     logger.warning(
                         "Connection error sending message to %s (attempt %d/%d): %s. Retrying in %d seconds...",
-                        chat_id, attempt + 1, max_retries, e, wait_time
+                        chat_id, attempt + 1, max_retries, error_msg, wait_time
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    error_text = f"Connection error after {max_retries} attempts: {e}"
-                    logger.error("Connection error sending message to %s after %d attempts: %s", chat_id, max_retries, e)
+                    error_msg = _format_exception(e)
+                    error_text = f"Connection error after {max_retries} attempts: {error_msg}"
+                    logger.error("Connection error sending message to %s after %d attempts: %s", chat_id, max_retries, error_msg)
                     return DeliveryReport(chat_id=chat_id, ok=False, error=error_text)
             except Exception as e:
                 error_text = f"Unexpected error: {e}"
@@ -1754,14 +1881,16 @@ class TelegramSender:
                 except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
                     if attempt < max_retries - 1:
                         wait_time = retry_delay * (2 ** attempt)
+                        error_msg = _format_exception(e)
                         logger.warning(
                             "Connection error sending photo to %s (attempt %d/%d): %s. Retrying in %d seconds...",
-                            chat_id, attempt + 1, max_retries, e, wait_time
+                            chat_id, attempt + 1, max_retries, error_msg, wait_time
                         )
                         await asyncio.sleep(wait_time)
                     else:
-                        logger.error("Connection error sending photo to %s after %d attempts: %s", chat_id, max_retries, e)
-                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                        error_msg = _format_exception(e)
+                        logger.error("Connection error sending photo to %s after %d attempts: %s", chat_id, max_retries, error_msg)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {error_msg}"))
                         return failures
                 except Exception as e:
                     logger.error("Unexpected error sending photo to %s: %s", chat_id, e, exc_info=True)
@@ -1777,7 +1906,7 @@ class TelegramSender:
         total_size_mb = sum(len(photo.content) for photo in photos) / (1024 * 1024)
         timeout = 180 if total_size_mb > 10 else 120 if total_size_mb > 5 else 60
         
-        # Retry logic для сетевых ошибок
+        # Retry logic для сетевых ошибок (photos)
         max_retries = 3
         retry_delay = 0.5  # Уменьшено с 1 до 0.5 для более быстрой обработки
         success = False
@@ -1936,14 +2065,16 @@ class TelegramSender:
             except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
                 if attempt < max_retries - 1:
                     wait_time = retry_delay * (2 ** attempt)
+                    error_msg = _format_exception(e)
                     logger.warning(
                         "Connection error sending media group to %s (attempt %d/%d): %s. Retrying in %d seconds...",
-                        chat_id, attempt + 1, max_retries, e, wait_time
+                        chat_id, attempt + 1, max_retries, error_msg, wait_time
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error("Connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, e)
-                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                    error_msg = _format_exception(e)
+                    logger.error("Connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, error_msg)
+                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {error_msg}"))
                     return failures
             except Exception as e:
                 logger.error("Unexpected error sending media group to %s: %s", chat_id, e, exc_info=True)
@@ -2106,14 +2237,16 @@ class TelegramSender:
                 except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
                     if attempt < max_retries - 1:
                         wait_time = retry_delay * (2 ** attempt)
+                        error_msg = _format_exception(e)
                         logger.warning(
                             "Connection error sending video to %s (attempt %d/%d): %s. Retrying in %d seconds...",
-                            chat_id, attempt + 1, max_retries, e, wait_time
+                            chat_id, attempt + 1, max_retries, error_msg, wait_time
                         )
                         await asyncio.sleep(wait_time)
                     else:
-                        logger.error("Connection error sending video to %s after %d attempts: %s", chat_id, max_retries, e)
-                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                        error_msg = _format_exception(e)
+                        logger.error("Connection error sending video to %s after %d attempts: %s", chat_id, max_retries, error_msg)
+                        failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {error_msg}"))
                         return failures
                 except Exception as e:
                     logger.error("Unexpected error sending video to %s: %s", chat_id, e, exc_info=True)
@@ -2312,14 +2445,16 @@ class TelegramSender:
             except (asyncio.TimeoutError, aiohttp.ClientError, aiohttp.ServerConnectionError) as e:
                 if attempt < max_retries - 1:
                     wait_time = retry_delay * (2 ** attempt)
+                    error_msg = _format_exception(e)
                     logger.warning(
                         "Connection error sending media group to %s (attempt %d/%d): %s. Retrying in %d seconds...",
-                        chat_id, attempt + 1, max_retries, e, wait_time
+                        chat_id, attempt + 1, max_retries, error_msg, wait_time
                     )
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error("Connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, e)
-                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {e}"))
+                    error_msg = _format_exception(e)
+                    logger.error("Connection error sending media group to %s after %d attempts: %s", chat_id, max_retries, error_msg)
+                    failures.append(DeliveryReport(chat_id=chat_id, ok=False, error=f"Connection error after {max_retries} attempts: {error_msg}"))
                     return failures
             except Exception as e:
                 logger.error("Unexpected error sending media group to %s: %s", chat_id, e, exc_info=True)

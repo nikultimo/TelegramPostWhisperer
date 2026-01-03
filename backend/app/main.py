@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from pathlib import Path
 from typing import List, Optional
 
+import aiofiles
 import yaml
 from dotenv import load_dotenv
 from fastapi import (
@@ -41,6 +43,8 @@ from .telegram_sender import (
     load_chat_ids_from_csv,
     save_blocked_users,
     load_blocked_users,
+    save_blocked_users_async,
+    load_blocked_users_async,
     is_blocked_user_error,
 )
 from .settings import (
@@ -152,7 +156,7 @@ async def get_bots() -> dict:
     """
     Get list of available bots from bots.yaml file.
     """
-    bots = load_bots_from_yaml()
+    bots = await run_in_threadpool(load_bots_from_yaml)
     return {
         "bots": [{"name": bot.name, "token": bot.token} for bot in bots],
         "exists": len(bots) > 0
@@ -184,16 +188,23 @@ async def get_csv_files() -> dict:
     
     csv_files = []
     try:
-        for file_path in data_dir.glob("*.csv"):
-            # Count users in CSV file
-            user_count = 0
+        # Collect all CSV files first
+        csv_paths = list(data_dir.glob("*.csv"))
+        
+        # Process files asynchronously
+        async def count_users(file_path: Path) -> int:
             try:
-                with open(file_path, "rb") as f:
-                    csv_bytes = f.read()
-                    user_count = len(load_chat_ids_from_csv(csv_bytes))
+                async with aiofiles.open(file_path, "rb") as f:
+                    csv_bytes = await f.read()
+                    return len(await run_in_threadpool(load_chat_ids_from_csv, csv_bytes))
             except Exception as e:
                 logger.warning(f"Failed to count users in {file_path.name}: {e}")
-            
+                return 0
+        
+        # Process all files concurrently
+        user_counts = await asyncio.gather(*[count_users(fp) for fp in csv_paths])
+        
+        for file_path, user_count in zip(csv_paths, user_counts):
             csv_files.append({
                 "name": file_path.name,
                 "path": str(file_path),
@@ -535,8 +546,8 @@ async def send_broadcast(
             )
         
         try:
-            with open(csv_path, "rb") as f:
-                csv_bytes = f.read()
+            async with aiofiles.open(csv_path, "rb") as f:
+                csv_bytes = await f.read()
         except Exception as exc:
             raise HTTPException(
                 status_code=400,
@@ -557,7 +568,7 @@ async def send_broadcast(
     # Note: We'll filter blocked users per bot token later, after we know which bots are being used
     # For now, load all chat IDs without filtering (filtering will happen per bot)
     try:
-        chat_ids = load_chat_ids_from_csv(csv_bytes, filter_blocked=False)
+        chat_ids = await run_in_threadpool(load_chat_ids_from_csv, csv_bytes, filter_blocked=False)
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=400, detail=f"Failed to read CSV: {exc}") from exc
 
@@ -638,7 +649,7 @@ async def send_broadcast(
     
     for bot_token in tokens_to_use:
         # Filter out blocked users for this specific bot token
-        blocked_users_for_bot = load_blocked_users(bot_token) if bot_token else set()
+        blocked_users_for_bot = await load_blocked_users_async(bot_token) if bot_token else set()
         filtered_chat_ids = [cid for cid in chat_ids if cid not in blocked_users_for_bot]
         
         if blocked_users_for_bot:
@@ -675,7 +686,7 @@ async def send_broadcast(
         # Save blocked users to file for this specific bot token
         if blocked_user_ids_for_bot:
             try:
-                save_blocked_users(bot_token, blocked_user_ids_for_bot)
+                await save_blocked_users_async(bot_token, blocked_user_ids_for_bot)
                 logger.info(f"Saved {len(blocked_user_ids_for_bot)} blocked user(s) for bot token {bot_token[:20]}...")
             except Exception as e:
                 logger.error(f"Failed to save blocked users for bot token: {e}", exc_info=True)
